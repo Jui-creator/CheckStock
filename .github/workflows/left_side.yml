@@ -1,0 +1,91 @@
+name: 左側潛力庫盤後篩選
+
+on:
+  # 由 Google Apps Script 每個交易日 18:00~19:00 觸發（triggerLeftSide）。
+  # 也可到 Actions 頁面點「Run workflow」手動執行。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: left-side-screen
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests aiohttp
+
+      - name: 還原每日資料快取
+        uses: actions/cache/restore@v4
+        with:
+          path: left_data
+          key: left-data-${{ github.run_id }}
+          restore-keys: |
+            left-data-
+
+      - name: 還原產業鏈快取
+        uses: actions/cache/restore@v4
+        with:
+          path: ic_sector_cache.json
+          key: ic-sector-${{ github.run_id }}
+          restore-keys: |
+            ic-sector-
+
+      # 強勢股「黏著」需要讀取前一次 commit 的 strong_stock_pool.json，
+      # 所以 Checkout 之後不要刪除這個檔案。
+      - name: 執行盤後選股（左側潛力庫 + 短線轉強股 + 強勢股池 + 選股診斷）
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u left_side.py
+
+      - name: 儲存每日資料快取
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: left_data
+          key: left-data-${{ github.run_id }}
+
+      # 左側清單與強勢股（含全市場計算基準、池內天數）commit 回 repo，隔天雷達與盤後選股讀取。
+      - name: 儲存清單回 repo
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add left_side_watchlist.json strong_stock_pool.json
+          git diff --staged --quiet && exit 0
+          git commit -m "更新左側潛力庫、短線轉強股與強勢股 $(date '+%Y-%m-%d')"
+          git pull --rebase
+          git push
+
+      - name: 上傳 CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: after-market-lists
+          path: |
+            left_side_watchlist.csv
+            short_term_pool.csv
+            strong_stock_pool.csv
+            pool_diagnosis.csv
+          if-no-files-found: ignore
