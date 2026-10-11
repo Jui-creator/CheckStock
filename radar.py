@@ -1,14 +1,16 @@
 """飆股雷達 v53：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:15～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
-  A（三擇一，滿足任一項即可）
+  A（三擇一，滿足任一項即可；三者分工不同）
+    A1 負責抓「初次由下往上穿越均線」的翻揚起漲點；A2 負責抓「開盤直接跳空強勢表態」的極強勢追價；
+    A3 負責抓「不管昨天在哪，只要今天出現均線糾結後帶量向上變盤發散」的壓縮彈簧爆發點（不要求昨天在均線之下）。
     A1 均線突破首日：昨收 < max(MA5, MA10, MA20)，且現價同時 > MA5、MA10、MA20（MA 含今日現價）。
     A2 強勢跳空：今日開盤 > 昨日最高價 × 1.02。
     A3 均線糾結突破：
          壓縮期  昨日 MA5/MA10/MA20 三者「最高與最低」的差距 ≤ 3%（A3_SQUEEZE_PCT）。
          表態期  現價突破糾結均線群的高點（昨日與今日 MA5/10/20 中最高者）。量能由 B 條件把關。
   B 主力爆量（同期比較法，兩項都要成立）
-    B1 目前累積量 ≥ 前 5 日「同時間」累積量平均（每個時間點排除最大的一天）× 1.5
+    B1 目前累積量 ≥ 前 5 日「同時間」累積量平均（每個時間點排除最大的一天再平均）× 1.5
     B2 目前累積量 ≥ 昨日「同時間」累積量
     （同期曲線由 baseline.py 每晚用富邦 1 分 K 計算，存成 volume_baseline.json）
   C 流動性與熱度（全部成立）
@@ -85,6 +87,7 @@ EVAL_START_MINUTE = 15              # 開盤後第 15 分鐘（09:15）才開始
 MIN_BASELINE_CUM = 50               # 同時間 5 日均量低於 50 張就不判斷
 SCALE_CAP = 15.0                    # 預估成交額的放大倍數上限（全日量 / 同時間量）
 DAILY_SIGNAL_CAP = 0                # 每日盤中訊號上限（0 = 不限）
+
 # ---- 二次確認（Double-Confirmation）----
 CONFIRM_MIN_GAP_SECONDS = 10        # 兩次符合至少相隔幾秒（避免同一份快照被重複計成兩次）
 CONFIRM_MAX_GAP_SECONDS = 45        # 超過這麼久才再次符合，就不算「下一次掃描」，重新當成首次
@@ -99,7 +102,6 @@ MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE = 9, 0
 SIGNAL_END_MINUTES = 13 * 60 + 30   # 13:30 以後不再發盤中訊號
 CLOSE_CONFIRM_HOUR, CLOSE_CONFIRM_MINUTE = 13, 35
 OPEN_TO_CLOSE_MINUTES = 271         # 09:00 ~ 13:30（含 13:30 收盤集合競價那一根）
-
 # 同期量曲線的取樣點：開盤後經過的分鐘數 m，值 = 第 m 分鐘開始前的累積量（張）
 # 0~15 每分鐘一點（開盤量集中）、之後每 5 分鐘一點、最後 271 = 全日量；點與點之間線性內插
 MARKS = sorted(set(list(range(0, 16)) + list(range(20, 271, 5)) + [271]))
@@ -155,12 +157,11 @@ INDUSTRY_CODE_NAME = {
     "34": "電子商務", "35": "綠能環保", "36": "數位雲端",
     "37": "運動休閒", "38": "居家生活",
 }
-
 UNRELIABLE_MARKETS = set()
 HIGH_FALLBACK = {"rows": 0}         # 官方表格沒有「最高價」欄位、改用收盤價代替的筆數
 ALERT_QUEUE = []
 STATE = {"date": "", "triggered": {}, "signals": []}
-PENDING = {}                         # 待確認觀察池：{代號: {"time": datetime, "price": float, "kind": str}}（只存在記憶體）
+PENDING = {}                        # 待確認觀察池：{代號: {"time": datetime, "price": float, "kind": str}}（只存在記憶體）
 
 
 # =========================
@@ -1213,7 +1214,8 @@ def a3_check(base: dict, price: float, mas):
 def a_conditions(base: dict, price: float, open_: float):
     """回傳 (a1, a2, a3, (ma5, ma10, ma20), a1_prev, a1_now, a3_info)。
     A1 = 昨收 < max(昨日 MA5/10/20)，且現價同時 > 今日 MA5/10/20；A2 = 開盤 > 昨高 × 1.02；
-    A3 = 昨日 MA5/10/20 糾結（差距 ≤ A3_SQUEEZE_PCT）且現價突破均線群高點。"""
+    A3 = 昨日 MA5/10/20 糾結（差距 ≤ A3_SQUEEZE_PCT）且現價突破均線群高點。
+    A3 不看昨收在均線上或下（與 A1 的「由下往上首次穿越」區分）：只要糾結 + 今日向上突破群高點即成立。"""
     mas = realtime_mas(base, price)
     ma5, ma10, ma20 = mas
     a1_prev = base["yest_close"] < max(base["true_ma5"], base["true_ma10"], base["true_ma20"])
@@ -1322,8 +1324,11 @@ def debug_line(base: dict, bl, row: dict, x: float) -> str:
                 f"｜昨日同期 {yest_now:,.0f}（{vol / yest_now if yest_now else 0:.2f}x）｜預估額 {val * scale / 1e8:.2f}億")
     else:
         btxt = "無同期量基準"
+    sp = "無" if a3i["spread"] is None else round(a3i["spread"], 2)
     return (f"[診斷 {base['code']} {base['name']}] 價 {price}｜開 {open_}｜漲幅 {chg if chg is None else round(chg, 2)}%"
-            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}｜A3 {a3}（昨日糾結 {'無' if a3i['spread'] is None else round(a3i['spread'], 2)}%，群高 {a3i['high']:.2f}）｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
+            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}"
+            f"｜A3 {a3}（昨日糾結 {sp}%，群高 {a3i['high']:.2f}）"
+            f"｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
 
 
 def check_close(base: dict, bl, row: dict):
@@ -1425,7 +1430,8 @@ def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
 
 def signal_row(sig: dict, now: datetime) -> dict:
     return {
-        "時間": now.strftime("%H:%M:%S"), "首次符合時間": sig.get("first_time", ""), "代號": sig["code"], "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
+        "時間": now.strftime("%H:%M:%S"), "首次符合時間": sig.get("first_time", ""), "代號": sig["code"],
+        "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
         "型態": sig["kind"], "現價": round(sig["price"], 2), "漲幅(%)": round(sig["chg"], 2),
         "開盤": round(sig["open"], 2), "昨收": round(sig["yest_close"], 2), "昨高": round(sig["yest_high"], 2),
         "累積量(張)": int(sig["vol"]), "5日同期均量(張)": int(sig["avg_now"]),
@@ -1439,7 +1445,7 @@ def signal_row(sig: dict, now: datetime) -> dict:
 
 def export_signal_csv(day_str: str) -> pathlib.Path:
     with SIGNAL_CSV_FILE.open("w", newline="", encoding="utf-8-sig") as fh:
-        csv.writer(fh).writerow([f"訊號日期：{day_str}（盤中 A+B+C，依時間排序）"])
+        csv.writer(fh).writerow([f"訊號日期：{day_str}（盤中 A+B+C＋二次確認，依時間排序）"])
         writer = csv.DictWriter(fh, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(STATE["signals"])
@@ -1604,8 +1610,8 @@ def apply_double_confirm(candidates: list, now: datetime) -> list:
         new_pending[code] = {"time": now, "price": sig["price"], "kind": sig["kind"]}
         print(f"[待確認] {code} {sig['name']}（{sig['kind']}，{sig['chg']:+.1f}%，量 {sig['ratio_avg']:.2f}x）"
               f"首次符合，等下一輪再確認", flush=True)
-    dropped = [c for c in PENDING if c not in new_pending and c not in {s['code'] for s in confirmed}]
-    for c in dropped:
+    confirmed_codes = {s["code"] for s in confirmed}
+    for c in [c for c in PENDING if c not in new_pending and c not in confirmed_codes]:
         print(f"[待確認] {c} 下一輪沒有再符合，移出觀察池（過濾假突破）", flush=True)
     PENDING.clear()
     PENDING.update(new_pending)
@@ -1890,7 +1896,8 @@ async def main_async() -> None:
                 print(f"    樣本 {sample_line(snap)}", flush=True)
             if polls % 20 == 0:
                 print(f"[漏斗/最近 20 輪累計人次] 判斷 {funnel['total']} → 現價>開盤 {funnel['red']} → 漲幅區間 {funnel['chg']} "
-                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']} → 進觀察池/再確認 {funnel['pend']} → 二次確認通過 {funnel['conf']}", flush=True)
+                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']} "
+                      f"→ 進觀察池/再確認 {funnel['pend']} → 二次確認通過 {funnel['conf']}", flush=True)
                 funnel = {k: 0 for k in funnel}
             await asyncio.sleep(max(1.0, POLL_INTERVAL - elapsed))
     except asyncio.CancelledError:
