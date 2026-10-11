@@ -1,6 +1,9 @@
 name: 飆股雷達每日自動掃描
 on:
-  # 只保留手動觸發：到 Actions 頁面點「Run workflow」執行（建議 08:30～08:55 之間啟動，程式會自己等到 09:00）。
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天 08:00~09:00 之間觸發，
+  # 也可到 Actions 頁面點「Run workflow」手動執行。
+  # 程式啟動後會自己等到 09:00 才開始輪詢，13:35 收盤確認後結束。
+  # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:35 約 335 分鐘，timeout 設 355 分鐘。
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,7 +15,7 @@ env:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 420
+    timeout-minutes: 355
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,18 +60,23 @@ jobs:
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
-      # 只 commit stock_states.json（當天已觸發名單，程式中斷重跑時不會重複通知）。
-      # push 前先 pull --rebase，避免和 baseline 工作流程的 commit 衝突。
+      # 要 commit 的檔案：
+      #   stock_states.json   當天已觸發名單（程式中斷重跑時不會重複通知）
+      #   volume_baseline.json 雷達開盤時若發現基準檔過期而自動補算，新檔也要存回 repo
+      # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add stock_states.json || true
+          git add stock_states.json volume_baseline.json || true
           git diff --staged --quiet && exit 0
           git commit -m "更新飆股雷達狀態 $(date '+%Y-%m-%d')"
-          git pull --rebase || true
-          git push || true
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break
+            echo "push 第 $i 次失敗，5 秒後重試"
+            sleep 5
+          done || true
       - name: 上傳 CSV
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,3 +86,21 @@ jobs:
             signals_today.csv
             close_confirm.csv
           if-no-files-found: ignore
+      # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
+      - name: 失敗通知
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "沒有設定 Telegram Secrets，略過通知"
+            exit 0
+          fi
+          TEXT=$(printf '❌ 【飆股雷達】%s 執行失敗、逾時或被取消\n時間：%s\n請查看：%s' \
+            "$WORKFLOW_NAME" "$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M')" "$RUN_URL")
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" > /dev/null || echo "Telegram 通知送出失敗"
