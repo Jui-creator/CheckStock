@@ -1,17 +1,14 @@
-"""飆股雷達 v53：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v54：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:15～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
-  A（三擇一，滿足任一項即可；三者分工不同）
-    A1 負責抓「初次由下往上穿越均線」的翻揚起漲點；
-    A2 負責抓「開盤直接跳空強勢表態」的極強勢追價；
-    A3 負責抓「不管昨天在哪，只要今天出現均線糾結後帶量向上變盤發散」的壓縮彈簧爆發點（不要求昨天在均線之下）。
+  A（三擇一，滿足任一項即可）
     A1 均線突破首日：昨收 < max(MA5, MA10, MA20)，且現價同時 > MA5、MA10、MA20（MA 含今日現價）。
     A2 強勢跳空：今日開盤 > 昨日最高價 × 1.02。
     A3 均線糾結突破：
          壓縮期  昨日 MA5/MA10/MA20 三者「最高與最低」的差距 ≤ 3%（A3_SQUEEZE_PCT）。
          表態期  現價突破糾結均線群的高點（昨日與今日 MA5/10/20 中最高者）。量能由 B 條件把關。
   B 主力爆量（同期比較法，兩項都要成立）
-    B1 目前累積量 ≥ 前 5 日「同時間」累積量平均（每個時間點排除最大的一天再平均）× 1.5
+    B1 目前累積量 ≥ 前 5 日「同時間」累積量平均（每個時間點排除最大的一天）× 1.5
     B2 目前累積量 ≥ 昨日「同時間」累積量
     （同期曲線由 baseline.py 每晚用富邦 1 分 K 計算，存成 volume_baseline.json）
   C 流動性與熱度（全部成立）
@@ -19,6 +16,11 @@
     C2 預估成交額 > 6 億（目前成交額 × 全日量 / 同時間量，用同一條同期曲線推算，不用 U 型經驗曲線）
     C3 現價 > 今日開盤（拒絕開高走低）
     C4 漲幅 +2% ~ +6%（用富邦快照的 changePercent，除權息日也正確）
+【靜態預算 + 動態即時】
+  盤前（baseline.py 盤後存進 stock_bases.json；雷達 08:xx 啟動載入時再用目前參數重算一次）先算好「收盤後就固定」的東西：
+    A1 前半段 a1_prev（昨收 < 昨日 MA5/10/20 最高）、A2 觸發價 a2_trigger（昨高 × 1.02）、
+    A3 壓縮期 a3_squeezed（昨日 MA5/10/20 差距 ≤ 3%）與糾結群昨日高點 prev_ma_max、MA5 減碼參考價 ma5_cut。
+  盤中每 15 秒只做「會跳動的」：現價 vs 今日即時 MA5/10/20、現價 vs 開盤、同期累積量比對，直接讀現成的 True/False。
 【實戰防禦】
   ① 09:15 才開始判斷：避開 09:00～09:15 集合競價搓合量釋放的混亂期。
   ② 二次確認（Double-Confirmation）：某檔在某一輪首次符合 A+B+C，先放進「待確認觀察池」，
@@ -88,7 +90,6 @@ EVAL_START_MINUTE = 15              # 開盤後第 15 分鐘（09:15）才開始
 MIN_BASELINE_CUM = 50               # 同時間 5 日均量低於 50 張就不判斷
 SCALE_CAP = 15.0                    # 預估成交額的放大倍數上限（全日量 / 同時間量）
 DAILY_SIGNAL_CAP = 0                # 每日盤中訊號上限（0 = 不限）
-
 # ---- 二次確認（Double-Confirmation）----
 CONFIRM_MIN_GAP_SECONDS = 10        # 兩次符合至少相隔幾秒（避免同一份快照被重複計成兩次）
 CONFIRM_MAX_GAP_SECONDS = 45        # 超過這麼久才再次符合，就不算「下一次掃描」，重新當成首次
@@ -103,6 +104,7 @@ MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE = 9, 0
 SIGNAL_END_MINUTES = 13 * 60 + 30   # 13:30 以後不再發盤中訊號
 CLOSE_CONFIRM_HOUR, CLOSE_CONFIRM_MINUTE = 13, 35
 OPEN_TO_CLOSE_MINUTES = 271         # 09:00 ~ 13:30（含 13:30 收盤集合競價那一根）
+
 # 同期量曲線的取樣點：開盤後經過的分鐘數 m，值 = 第 m 分鐘開始前的累積量（張）
 # 0~15 每分鐘一點（開盤量集中）、之後每 5 分鐘一點、最後 271 = 全日量；點與點之間線性內插
 MARKS = sorted(set(list(range(0, 16)) + list(range(20, 271, 5)) + [271]))
@@ -158,11 +160,12 @@ INDUSTRY_CODE_NAME = {
     "34": "電子商務", "35": "綠能環保", "36": "數位雲端",
     "37": "運動休閒", "38": "居家生活",
 }
+
 UNRELIABLE_MARKETS = set()
 HIGH_FALLBACK = {"rows": 0}         # 官方表格沒有「最高價」欄位、改用收盤價代替的筆數
 ALERT_QUEUE = []
 STATE = {"date": "", "triggered": {}, "signals": []}
-PENDING = {}                        # 待確認觀察池：{代號: {"time": datetime, "price": float, "kind": str}}（只存在記憶體）
+PENDING = {}                         # 待確認觀察池：{代號: {"time": datetime, "price": float, "kind": str}}（只存在記憶體）
 
 
 # =========================
@@ -653,6 +656,29 @@ def _trimmed_avg_vol(v5: list) -> float:
     return float(sum(trimmed)) / len(trimmed)
 
 
+def precompute_static(base: dict) -> dict:
+    """盤前靜態預算：只用「昨日收盤後就固定」的數字，算出盤中要用的布林值與門檻，寫回 base。
+    盤中不必再重算昨天的數學；參數（GAP_RATIO、A3_SQUEEZE_PCT）改了，載入時重算即可，不必重跑 baseline。"""
+    prev = (base["true_ma5"], base["true_ma10"], base["true_ma20"])
+    lo, hi = min(prev), max(prev)
+    spread = (hi / lo - 1) * 100 if lo > 0 else None
+    base["prev_ma_max"] = hi
+    base["prev_ma_min"] = lo
+    base["a1_prev"] = bool(base["yest_close"] < hi)                         # A1 前半段：昨收 < 昨日均線最高
+    base["a2_trigger"] = base["yest_high"] * GAP_RATIO                      # A2：今日開盤 > 這個價
+    base["a3_spread"] = spread                                              # A3 壓縮期：昨日 MA5/10/20 差距（%）
+    base["a3_squeezed"] = bool(spread is not None and spread <= A3_SQUEEZE_PCT)
+    base["ma5_cut"] = base["sum_4"] / 4                                     # MA5 減碼參考價（盤中通知用）
+    return base
+
+
+def precompute_summary(bases: dict) -> str:
+    liquid = [b for b in bases.values() if b.get("liquid")]
+    a1 = sum(1 for b in liquid if b.get("a1_prev"))
+    a3 = sum(1 for b in liquid if b.get("a3_squeezed"))
+    return f"盤前預算（{len(liquid)} 檔達標）：A1 前半段成立 {a1} 檔｜A3 壓縮期成立 {a3} 檔｜A2 觸發價（昨高×{GAP_RATIO}）已備妥"
+
+
 def load_all_stock_bases(include_today=None) -> dict:
     """建立每檔股票的歷史基底（昨收、昨高、MA、均量）。
     include_today：None = 自動（平日 13:35 以後嘗試納入今日官方資料）；False = 一律只用今日以前的資料。"""
@@ -728,6 +754,7 @@ def load_all_stock_bases(include_today=None) -> dict:
             "avg_turnover_5d": turnover_5d,
             "liquid": avg5_simple >= MIN_VOL5_LOTS,
         }
+        precompute_static(stock_bases[code])
     tse_count = sum(base["market"] == "tse" for base in stock_bases.values())
     liquid = sum(1 for b in stock_bases.values() if b["liquid"])
     print(
@@ -1001,6 +1028,10 @@ def load_bases_cache(feed, today: date_cls):
             b["asof_date"] = date_cls.fromisoformat(str(b["asof_date"]))
         except Exception:
             continue
+        try:
+            precompute_static(b)                 # 用目前參數重算靜態布林值（舊快取沒有這些欄位也沒關係）
+        except Exception:
+            continue
         bases[code] = b
     if not bases:
         return None, "基底快取是空的"
@@ -1199,32 +1230,25 @@ def realtime_mas(base: dict, price: float):
     return ((base["sum_4"] + price) / 5, (base["sum_9"] + price) / 10, (base["sum_19"] + price) / 20)
 
 
-def a3_check(base: dict, price: float, mas):
-    """A3 均線糾結突破。回傳 (a3, 糾結幅度%, 均線群高點, 壓縮期成立, 表態期成立)。
-    壓縮期：昨日 MA5/10/20 的（最高 / 最低 - 1）≤ A3_SQUEEZE_PCT；
-    表態期：現價 > 均線群高點（昨日與今日 MA5/10/20 中最高者）。"""
-    prev = (base["true_ma5"], base["true_ma10"], base["true_ma20"])
-    lo, hi_prev = min(prev), max(prev)
-    spread = (hi_prev / lo - 1) * 100 if lo > 0 else None
-    squeezed = spread is not None and spread <= A3_SQUEEZE_PCT
-    cluster_high = max(hi_prev, *mas)
-    broke = price > cluster_high
-    return (squeezed and broke), spread, cluster_high, squeezed, broke
-
-
 def a_conditions(base: dict, price: float, open_: float):
     """回傳 (a1, a2, a3, (ma5, ma10, ma20), a1_prev, a1_now, a3_info)。
-    A1 = 昨收 < max(昨日 MA5/10/20)，且現價同時 > 今日 MA5/10/20；A2 = 開盤 > 昨高 × 1.02；
-    A3 = 昨日 MA5/10/20 糾結（差距 ≤ A3_SQUEEZE_PCT）且現價突破均線群高點。
-    A3 不看昨收在均線上或下（與 A1 的「由下往上首次穿越」區分）：只要糾結 + 今日向上突破群高點即成立。"""
-    mas = realtime_mas(base, price)
+    靜態部分（昨日收盤後固定）直接讀 precompute_static 的結果；動態部分（今日即時均線、現價）才在這裡算：
+      A1 = a1_prev（預算）且 現價同時 > 今日即時 MA5/10/20
+      A2 = 開盤 > a2_trigger（預算：昨高 × 1.02）
+      A3 = a3_squeezed（預算：昨日 MA5/10/20 差距 ≤ A3_SQUEEZE_PCT）且 現價 > 均線群高點（昨日群高與今日即時 MA 的最大值）
+    A3 不看昨收在均線上或下（與 A1 的「由下往上首次穿越」區分）。"""
+    if "a1_prev" not in base:                    # 沒經過預算的 base（例如單元測試）：補算一次
+        precompute_static(base)
+    mas = realtime_mas(base, price)              # 今日即時 MA：會隨現價跳動，只能盤中算
     ma5, ma10, ma20 = mas
-    a1_prev = base["yest_close"] < max(base["true_ma5"], base["true_ma10"], base["true_ma20"])
+    a1_prev = base["a1_prev"]
     a1_now = price > ma5 and price > ma10 and price > ma20
-    a2 = open_ > base["yest_high"] * GAP_RATIO
-    a3, spread, cluster_high, squeezed, broke = a3_check(base, price, mas)
-    a3_info = {"spread": spread, "high": cluster_high, "squeezed": squeezed, "broke": broke}
-    return (a1_prev and a1_now), a2, a3, mas, a1_prev, a1_now, a3_info
+    a2 = open_ > base["a2_trigger"]
+    cluster_high = max(base["prev_ma_max"], ma5, ma10, ma20)
+    squeezed = base["a3_squeezed"]
+    broke = price > cluster_high
+    a3_info = {"spread": base["a3_spread"], "high": cluster_high, "squeezed": squeezed, "broke": broke}
+    return (a1_prev and a1_now), a2, (squeezed and broke), mas, a1_prev, a1_now, a3_info
 
 
 def _kind(a1: bool, a2: bool, a3: bool = False) -> str:
@@ -1301,12 +1325,12 @@ def evaluate_intraday(base: dict, bl: dict, row: dict, x: float, funnel: dict):
         "kind": _kind(a1, a2, a3), "price": price, "open": open_, "chg": chg,
         "yest_close": base["yest_close"], "yest_high": base["yest_high"],
         "a3_spread": a3_info["spread"], "a3_high": a3_info["high"],
-        "prev_ma_max": max(base["true_ma5"], base["true_ma10"], base["true_ma20"]),
+        "prev_ma_max": base["prev_ma_max"],
         "vol": vol, "avg_now": avg_now, "yest_now": yest_now,
         "ratio_avg": vol / avg_now, "ratio_yest": (vol / yest_now) if yest_now > 0 else None,
         "val": val, "est_turnover": est_turnover,
         "ma5": ma5, "ma10": ma10, "ma20": ma20,
-        "ma5_cut": base["sum_4"] / 4,       # 收盤價跌破這個價 = 收盤跌破 MA5
+        "ma5_cut": base["ma5_cut"],         # 收盤價跌破這個價 = 收盤跌破 MA5（盤前預算）
     }
 
 
@@ -1325,11 +1349,8 @@ def debug_line(base: dict, bl, row: dict, x: float) -> str:
                 f"｜昨日同期 {yest_now:,.0f}（{vol / yest_now if yest_now else 0:.2f}x）｜預估額 {val * scale / 1e8:.2f}億")
     else:
         btxt = "無同期量基準"
-    sp = "無" if a3i["spread"] is None else round(a3i["spread"], 2)
     return (f"[診斷 {base['code']} {base['name']}] 價 {price}｜開 {open_}｜漲幅 {chg if chg is None else round(chg, 2)}%"
-            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}"
-            f"｜A3 {a3}（昨日糾結 {sp}%，群高 {a3i['high']:.2f}）"
-            f"｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
+            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}｜A3 {a3}（昨日糾結 {'無' if a3i['spread'] is None else round(a3i['spread'], 2)}%，群高 {a3i['high']:.2f}）｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
 
 
 def check_close(base: dict, bl, row: dict):
@@ -1363,7 +1384,7 @@ def check_close(base: dict, bl, row: dict):
             parts.append("A1：昨日收盤已站上所有均線（非突破首日）")
         elif not a1_now:
             parts.append(f"A1：收盤 {price:.2f} 未同時站上 MA5/10/20（{ma5:.2f}/{ma10:.2f}/{ma20:.2f}）")
-        parts.append(f"A2：開盤 {open_:.2f} 未超過昨高×1.02（{base['yest_high'] * GAP_RATIO:.2f}）")
+        parts.append(f"A2：開盤 {open_:.2f} 未超過昨高×{GAP_RATIO}（{base['a2_trigger']:.2f}）")
         if not a3_info["squeezed"]:
             sp = a3_info["spread"]
             parts.append(f"A3：昨日 MA 糾結幅度 {'無資料' if sp is None else f'{sp:.2f}%'}（需 ≤ {A3_SQUEEZE_PCT:g}%）")
@@ -1431,8 +1452,7 @@ def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
 
 def signal_row(sig: dict, now: datetime) -> dict:
     return {
-        "時間": now.strftime("%H:%M:%S"), "首次符合時間": sig.get("first_time", ""), "代號": sig["code"],
-        "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
+        "時間": now.strftime("%H:%M:%S"), "首次符合時間": sig.get("first_time", ""), "代號": sig["code"], "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
         "型態": sig["kind"], "現價": round(sig["price"], 2), "漲幅(%)": round(sig["chg"], 2),
         "開盤": round(sig["open"], 2), "昨收": round(sig["yest_close"], 2), "昨高": round(sig["yest_high"], 2),
         "累積量(張)": int(sig["vol"]), "5日同期均量(張)": int(sig["avg_now"]),
@@ -1446,7 +1466,7 @@ def signal_row(sig: dict, now: datetime) -> dict:
 
 def export_signal_csv(day_str: str) -> pathlib.Path:
     with SIGNAL_CSV_FILE.open("w", newline="", encoding="utf-8-sig") as fh:
-        csv.writer(fh).writerow([f"訊號日期：{day_str}（盤中 A+B+C＋二次確認，依時間排序）"])
+        csv.writer(fh).writerow([f"訊號日期：{day_str}（盤中 A+B+C，依時間排序）"])
         writer = csv.DictWriter(fh, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(STATE["signals"])
@@ -1611,8 +1631,8 @@ def apply_double_confirm(candidates: list, now: datetime) -> list:
         new_pending[code] = {"time": now, "price": sig["price"], "kind": sig["kind"]}
         print(f"[待確認] {code} {sig['name']}（{sig['kind']}，{sig['chg']:+.1f}%，量 {sig['ratio_avg']:.2f}x）"
               f"首次符合，等下一輪再確認", flush=True)
-    confirmed_codes = {s["code"] for s in confirmed}
-    for c in [c for c in PENDING if c not in new_pending and c not in confirmed_codes]:
+    dropped = [c for c in PENDING if c not in new_pending and c not in {s['code'] for s in confirmed}]
+    for c in dropped:
         print(f"[待確認] {c} 下一輪沒有再符合，移出觀察池（過濾假突破）", flush=True)
     PENDING.clear()
     PENDING.update(new_pending)
@@ -1703,7 +1723,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v53：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
+    print("飆股雷達 v54：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -1754,10 +1774,11 @@ async def main_async() -> None:
 
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v53】即時監控啟動（A+B+C＋二次確認）</b>",
+        "📡 <b>【飆股雷達 v54】即時監控啟動（A+B+C＋二次確認）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
         f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
+        precompute_summary(stock_bases),
         f"A（三擇一）：A1 均線突破首日｜A2 開盤 > 昨高 ×{GAP_RATIO}｜A3 均線糾結（MA5/10/20 差距 ≤ {A3_SQUEEZE_PCT:g}%）後突破群高點",
         f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE} 且 ≥ 昨日同期量",
         f"C：預估成交額 > {MIN_EST_TURNOVER / 1e8:.0f} 億、現價 > 開盤、漲幅 +{CHG_MIN:.0f}%～+{CHG_MAX:.0f}%",
@@ -1897,8 +1918,7 @@ async def main_async() -> None:
                 print(f"    樣本 {sample_line(snap)}", flush=True)
             if polls % 20 == 0:
                 print(f"[漏斗/最近 20 輪累計人次] 判斷 {funnel['total']} → 現價>開盤 {funnel['red']} → 漲幅區間 {funnel['chg']} "
-                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']} "
-                      f"→ 進觀察池/再確認 {funnel['pend']} → 二次確認通過 {funnel['conf']}", flush=True)
+                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']} → 進觀察池/再確認 {funnel['pend']} → 二次確認通過 {funnel['conf']}", flush=True)
                 funnel = {k: 0 for k in funnel}
             await asyncio.sleep(max(1.0, POLL_INTERVAL - elapsed))
     except asyncio.CancelledError:
