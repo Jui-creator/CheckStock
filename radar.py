@@ -1,4 +1,4 @@
-"""飆股雷達 v50：1～2 週短線波段「A + B + C」進場策略（富邦 Neo API 即時行情，不再使用 MIS）。
+"""飆股雷達 v52：1～2 週短線波段「A + B + C」進場策略（富邦 Neo API 即時行情，不再使用 MIS）。
 
 【進場條件】09:05～13:30 持續輪詢，同時滿足 A + B + C 就發 Telegram（同一檔同一天只發一次）：
   A（二擇一）
@@ -22,7 +22,9 @@
 
 【檔案】
   stock_states.json     當日已觸發的股票與訊號紀錄（daily.yml 會 commit 回 repo；換日自動重置）
-  volume_baseline.json  同期量基準（baseline.py 每晚產生）
+  volume_baseline.json  同期量基準（baseline.py 每晚產生；缺檔或基準日過期時，雷達啟動後會自動補算）
+  stock_bases.json      歷史基底快取（baseline.py 每晚產生：昨收、昨高、MA、均量、族群）。
+                        雷達 09:00 啟動時直接讀它，不用再花 2～3 分鐘抓官方資料；基準日不對才改走即時預載
   ic_sector_cache.json  櫃買產業價值鏈快取（actions/cache）
   signals_today.csv     今日盤中訊號
   close_confirm.csv     收盤確認明細
@@ -54,6 +56,7 @@ TW_TZ = timezone(timedelta(hours=8), name="Asia/Taipei")
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "stock_states.json"
 BASELINE_FILE = BASE_DIR / "volume_baseline.json"
+BASES_FILE = BASE_DIR / "stock_bases.json"
 IC_CACHE_FILE = BASE_DIR / "ic_sector_cache.json"
 SIGNAL_CSV_FILE = BASE_DIR / "signals_today.csv"
 CLOSE_CSV_FILE = BASE_DIR / "close_confirm.csv"
@@ -938,6 +941,224 @@ def load_baseline(stock_bases: dict):
 
 
 # =========================
+# 歷史基底快取（baseline.py 每晚存，雷達開盤直接讀）
+# =========================
+def save_bases_cache(bases: dict) -> None:
+    """把 5 日均量達標的股票基底存成 stock_bases.json（日期轉成字串）。"""
+    asof = max(b["asof_date"] for b in bases.values()).isoformat()
+    stocks = {}
+    for code, b in bases.items():
+        item = dict(b)
+        item["asof_date"] = b["asof_date"].isoformat()
+        stocks[code] = item
+    payload = {"rule": BASELINE_RULE, "asof": asof, "generated_at": now_tw().isoformat(timespec="seconds"),
+               "high_fallback": HIGH_FALLBACK["rows"], "stocks": stocks}
+    tmp = BASES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(BASES_FILE)
+    print(f"[基底快取] 已存 {len(stocks)} 檔，基準日 {asof}，{BASES_FILE.stat().st_size / 1024:.0f} KB", flush=True)
+
+
+def load_bases_cache(feed, today: date_cls):
+    """回傳 (bases 或 None, 說明)。基準日必須等於「今天以前最近一個交易日」，否則不用（避免用到過期資料）。
+    最近交易日用富邦 2330 日 K 判斷（會處理連假）；富邦查詢失敗時，退而求其次要求基準日在 5 天內。"""
+    if not BASES_FILE.exists():
+        return None, "找不到 stock_bases.json"
+    try:
+        data = json.loads(BASES_FILE.read_text(encoding="utf-8"))
+        if data.get("rule") != BASELINE_RULE:
+            return None, f"基底快取規則版本不符（{data.get('rule')}）"
+        asof = date_cls.fromisoformat(str(data["asof"]))
+        stocks = data["stocks"]
+    except Exception as exc:
+        return None, f"基底快取讀取失敗（{type(exc).__name__}）"
+    expected = None
+    try:
+        days = trading_days(feed, today - timedelta(days=1))
+        expected = days[-1] if days else None
+    except Exception as exc:
+        print(f"[基底快取] 查詢最近交易日失敗（{type(exc).__name__}: {exc}），改用日期差判斷", flush=True)
+    if expected is not None:
+        if expected != asof.isoformat():
+            return None, f"快取基準日 {asof} 不是最近交易日 {expected}"
+    elif (today - asof).days > 5:
+        return None, f"快取基準日 {asof} 距今超過 5 天"
+    bases = {}
+    for code, item in stocks.items():
+        b = dict(item)
+        try:
+            b["asof_date"] = date_cls.fromisoformat(str(b["asof_date"]))
+        except Exception:
+            continue
+        bases[code] = b
+    if not bases:
+        return None, "基底快取是空的"
+    HIGH_FALLBACK["rows"] = int(data.get("high_fallback", 0) or 0)
+    return bases, f"夜間基底快取（基準日 {asof}，{len(bases)} 檔）"
+
+
+# =========================
+# 同期量基準的建置（baseline.py 與雷達的「自動補算」共用）
+# =========================
+BASELINE_CALL_INTERVAL = 1.15        # 每次歷史行情呼叫的最小間隔（秒），富邦限速 60 次/分
+BASELINE_MIN_COVERAGE = 0.6          # 成功算出基準的檔數 / 候選檔數 低於此值就視為失敗，不寫檔
+BASELINE_MIN_CANDLES_PER_DAY = 30    # 某一天的分 K 少於這個根數，視為該日資料不完整
+BASELINE_DAYS = 5
+BASELINE_MAX_MINUTE = OPEN_TO_CLOSE_MINUTES - 1      # 270 = 13:30 那一根
+
+
+def candle_minute(ts: str):
+    """'2026-07-09T13:30:00.000+08:00' → ('2026-07-09', 270)；解析失敗回傳 None。"""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(TW_TZ)
+    except Exception:
+        return None
+    return dt.strftime("%Y-%m-%d"), dt.hour * 60 + dt.minute - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE)
+
+
+def day_curves(candles: list, days: list):
+    """把分 K 依日期整理成 {日期: 取樣點上的累積量 list}。某天分 K 不足就不放進結果。"""
+    by_day = {d: [0.0] * (BASELINE_MAX_MINUTE + 1) for d in days}
+    counts = {d: 0 for d in days}
+    for c in candles:
+        parsed = candle_minute(c.get("date"))
+        vol = _f(c.get("volume"))
+        if parsed is None or vol is None or parsed[0] not in by_day:
+            continue
+        day, minute = parsed
+        if 0 <= minute <= BASELINE_MAX_MINUTE:
+            by_day[day][minute] += vol
+            counts[day] += 1
+    out = {}
+    for d in days:
+        if counts[d] < BASELINE_MIN_CANDLES_PER_DAY:
+            continue
+        cum = [0.0] * (BASELINE_MAX_MINUTE + 2)     # cum[m] = 第 m 分鐘開始前的累積量；cum[271] = 全日量
+        for i in range(BASELINE_MAX_MINUTE + 1):
+            cum[i + 1] = cum[i] + by_day[d][i]
+        out[d] = [cum[m] for m in MARKS]
+    return out
+
+
+def build_entry(curves: dict, days: list):
+    """5 天都齊才算。avg = 每個取樣點去掉最大的一天後平均；yest = 最後一天的曲線。"""
+    if len(curves) < BASELINE_DAYS or any(d not in curves for d in days):
+        return None
+    avg = []
+    for j in range(len(MARKS)):
+        vals = sorted(curves[d][j] for d in days)
+        avg.append(round(sum(vals[:-1]) / (len(vals) - 1), 1))
+    yest = [round(v, 1) for v in curves[days[-1]]]
+    return {"avg": avg, "yest": yest}
+
+
+def trading_days(feed, asof: date_cls) -> list:
+    """用 2330 的日 K 取得最近 5 個交易日（含基準日）。"""
+    start = (asof - timedelta(days=21)).isoformat()
+    rows = feed.candles("2330", start, asof.isoformat(), timeframe="D", fields=None)
+    days = sorted({str(r.get("date"))[:10] for r in rows if str(r.get("date"))[:10] <= asof.isoformat()})
+    return days[-BASELINE_DAYS:]
+
+
+def check_against_snapshot(feed, entries: dict, asof: str) -> str:
+    """分 K 加總（基準日全日量）對照富邦快照的 tradeVolume。"""
+    import statistics
+    try:
+        snap = feed.snapshot_all()
+    except Exception as exc:
+        return f"快照對照略過（{type(exc).__name__}）"
+    dates = {str(m.get("date", "")).replace("-", "") for m in snap["meta"].values()}
+    if asof.replace("-", "") not in dates:
+        return f"快照日期 {sorted(dates)} 不是基準日 {asof}，對照略過"
+    ratios = []
+    for code, e in entries.items():
+        row = snap["rows"].get(code)
+        tv = _f(row.get("tradeVolume")) if row else None
+        if tv and tv > 0:
+            ratios.append(e["yest"][-1] / tv)
+    if not ratios:
+        return "快照沒有可對照的資料"
+    med = statistics.median(ratios)
+    near = sum(1 for r in ratios if abs(r - 1) <= 0.02) / len(ratios)
+    verdict = "✅ 一致" if abs(med - 1) <= 0.02 and near >= 0.8 else "⚠️ 不一致，請檢查單位或 13:30 收盤集合競價那一根"
+    return f"分K加總 / 快照全日量：中位數 {med:.3f}，±2% 內 {near:.0%}（{len(ratios)} 檔）{verdict}"
+
+
+def build_baseline(stock_bases: dict, feed, source: str = "盤後計算") -> bool:
+    """用富邦 1 分 K 建立 volume_baseline.json。成功回傳 True（會寫檔並發 Telegram），失敗回傳 False（會發 Telegram）。
+    這是同步、耗時（約 15～20 分鐘）的函式；在雷達裡用 run_in_executor 於背景執行。"""
+    started = time.time()
+    title = f"【同期量基準】{source}"
+    asof = max(b["asof_date"] for b in stock_bases.values())
+    universe = sorted(c for c, b in stock_bases.items() if b["liquid"])
+    print(f"[基準] 基準日 {asof}，候選 {len(universe)} 檔（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張）", flush=True)
+    try:
+        days = trading_days(feed, asof)
+    except Exception as exc:
+        send_telegram(f"❌ <b>{title}</b> 查詢富邦交易日失敗：{type(exc).__name__}: {exc}")
+        return False
+    if len(days) < BASELINE_DAYS or days[-1] != asof.isoformat():
+        send_telegram(f"❌ <b>{title}</b> 富邦日 K 的最後交易日是 {days[-1] if days else '無'}，與官方基準日 {asof} 不符"
+                      f"（富邦歷史資料盤後 16:30 才更新，請稍後重跑）。")
+        return False
+    print(f"[基準] 基準日期：{', '.join(days)}", flush=True)
+
+    entries, skipped, errors = {}, [], 0
+    last_call = 0.0
+    for n, code in enumerate(universe, 1):
+        wait = BASELINE_CALL_INTERVAL - (time.time() - last_call)
+        if wait > 0:
+            time.sleep(wait)
+        last_call = time.time()
+        try:
+            candles = feed.candles(code, days[0], days[-1], timeframe="1")
+        except Exception as exc:
+            errors += 1
+            skipped.append(code)
+            print(f"  {code} 抓取失敗：{type(exc).__name__}: {exc}", flush=True)
+            continue
+        curves = day_curves(candles, days)
+        entry = build_entry(curves, days)
+        if n <= 3:
+            print(f"  [診斷] {code}：分K {len(candles)} 根，有資料的日期 {sorted(curves)}，"
+                  f"基準日全日量 {curves[days[-1]][-1] if days[-1] in curves else '無'}", flush=True)
+        if entry is None:
+            skipped.append(code)
+        else:
+            entries[code] = entry
+        if n % 50 == 0:
+            print(f"  進度 {n}/{len(universe)}，成功 {len(entries)}，略過 {len(skipped)}，已用 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
+
+    coverage = len(entries) / len(universe) if universe else 0
+    if coverage < BASELINE_MIN_COVERAGE:
+        send_telegram(f"❌ <b>{title}</b> 成功率只有 {coverage:.0%}（{len(entries)}/{len(universe)}，抓取錯誤 {errors}），"
+                      f"未更新 volume_baseline.json。請看 Actions log 的診斷行。")
+        return False
+
+    check_text = check_against_snapshot(feed, entries, asof.isoformat())
+    print(f"[基準] {check_text}", flush=True)
+    payload = {
+        "rule": BASELINE_RULE,
+        "asof": asof.isoformat(),
+        "days": days,
+        "marks": MARKS,
+        "generated_at": now_tw().isoformat(timespec="seconds"),
+        "stocks": entries,
+    }
+    tmp = BASELINE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(BASELINE_FILE)
+
+    minutes = (time.time() - started) / 60
+    skipped_txt = f"｜略過 {len(skipped)} 檔（分K不足 5 天或抓取失敗）" if skipped else ""
+    send_telegram(
+        f"✅ <b>{title}</b> 完成\n基準日 {asof}｜取樣日期 {days[0]} ~ {days[-1]}\n"
+        f"涵蓋 {len(entries)}/{len(universe)} 檔{skipped_txt}｜耗時 {minutes:.1f} 分鐘\n{check_text}")
+    print(f"[基準] 完成：{len(entries)}/{len(universe)} 檔，耗時 {minutes:.1f} 分鐘，檔案 {BASELINE_FILE.stat().st_size / 1024:.0f} KB", flush=True)
+    return True
+
+
+# =========================
 # 狀態檔（當天已觸發的股票）
 # =========================
 def load_states() -> None:
@@ -1262,6 +1483,54 @@ def market_status_text(feed, today: date_cls) -> str:
 
 
 # =========================
+# 快照健康檢查（資料有沒有在更新）
+# =========================
+STALL_ALERT_POLLS = 8                # 全市場累積量連續 8 輪（約 2 分鐘）完全沒變，就發警告
+STALL_CHECK_FROM_MINUTE = 3          # 開盤後第 3 分鐘起才檢查（開盤前累積量本來就不動）
+STALL_CHECK_UNTIL_MINUTE = 265       # 13:25 後不檢查（尾盤只剩集合競價，量可能暫時不動）
+
+
+def snapshot_lag_seconds(meta: dict, now: datetime):
+    """快照時間欄位落後現在幾秒；欄位缺漏或格式不符回傳 None。"""
+    best = None
+    for m in meta.values():
+        try:
+            raw = str(m.get("time", "")).strip().zfill(6)[:6]
+            d = str(m.get("date", "")).replace("-", "")
+            dt = datetime.strptime(f"{d} {raw}", "%Y%m%d %H%M%S").replace(tzinfo=TW_TZ)
+        except Exception:
+            continue
+        lag = (now - dt).total_seconds()
+        best = lag if best is None else min(best, lag)
+    return best
+
+
+def fmt_updated(value) -> str:
+    """富邦的 lastUpdated 是微秒時間戳，轉成台北時間 HH:MM:SS。"""
+    try:
+        return datetime.fromtimestamp(float(value) / 1_000_000, TW_TZ).strftime("%H:%M:%S")
+    except Exception:
+        return str(value) if value not in (None, "") else "-"
+
+
+def snapshot_summary(snap: dict, now: datetime):
+    """回傳 (全市場累積量張數, 這一輪 log 的快照摘要文字)。"""
+    total = sum((_f(r.get("tradeVolume")) or 0.0) for r in snap["rows"].values())
+    times = "/".join(f"{k.upper()} {snap['meta'][k].get('time', '?')}" for k in ("tse", "otc") if k in snap["meta"])
+    lag = snapshot_lag_seconds(snap["meta"], now)
+    lag_txt = "延遲 ?" if lag is None else f"延遲 {lag:.0f}s"
+    return total, f"快照時間 {times}｜{lag_txt}｜全市場累積量 {total:,.0f} 張"
+
+
+def sample_line(snap: dict, code: str = "2330") -> str:
+    row = snap["rows"].get(code)
+    if not row:
+        return f"{code} 不在快照中"
+    return (f"{code} {row.get('name', '')}｜現價 {row.get('lastPrice')}｜累積量 {row.get('tradeVolume')}"
+            f"｜更新 {fmt_updated(row.get('lastUpdated'))}")
+
+
+# =========================
 # 主程式
 # =========================
 async def _prepare_stock_bases(include_today=False):
@@ -1269,7 +1538,7 @@ async def _prepare_stock_bases(include_today=False):
     if not stock_bases:
         return {}
     try:
-        chain_map = await refresh_ic_chains(sorted(stock_bases.keys()))
+        chain_map = await refresh_ic_chains(sorted(c for c, b in stock_bases.items() if b["liquid"]))
     except Exception as exc:
         print(f"[產業鏈] 查詢流程例外，改用官方產業別: {type(exc).__name__}: {repr(exc)}", flush=True)
         chain_map = {}
@@ -1358,7 +1627,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v50：1～2 週短線波段 A+B+C（富邦 Neo API）", flush=True)
+    print("飆股雷達 v52：1～2 週短線波段 A+B+C（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -1373,13 +1642,6 @@ async def main_async() -> None:
     load_states()
     after_close = current >= _close_confirm_today(current)
 
-    stock_bases = await _prepare_stock_bases(include_today=False)
-    if not stock_bases:
-        send_telegram("❌ <b>【飆股雷達】</b> 無法建立歷史基底，監控未啟動")
-        return
-    baselines, bl_text = load_baseline(stock_bases)
-    print(f"[同期量基準] {bl_text}", flush=True)
-
     feed = FubonFeed()
     try:
         await loop.run_in_executor(None, feed.login)
@@ -1387,16 +1649,38 @@ async def main_async() -> None:
         send_telegram(f"❌ <b>【飆股雷達】</b> 富邦登入失敗，監控未啟動：{type(exc).__name__}: {exc}")
         raise
 
+    # 歷史基底：優先讀夜間快取（幾秒內完成，09:00 就能開始判斷）；不可用才即時向官方預載（約 2～3 分鐘）
+    stock_bases, bases_source = await loop.run_in_executor(None, load_bases_cache, feed, today)
+    if stock_bases:
+        print(f"[歷史基底] 使用{bases_source}", flush=True)
+    else:
+        print(f"[歷史基底] 快取不可用（{bases_source}），改向官方即時預載", flush=True)
+        stock_bases = await _prepare_stock_bases(include_today=False)
+        bases_source = "官方資料即時預載（夜間快取不可用）"
+    if not stock_bases:
+        send_telegram("❌ <b>【飆股雷達】</b> 無法建立歷史基底，監控未啟動")
+        return
+    baselines, bl_text = load_baseline(stock_bases)
+    print(f"[同期量基準] {bl_text}", flush=True)
+
     if after_close:
         print("已過收盤確認時間：直接執行收盤確認（盤中觸發紀錄取自 stock_states.json）", flush=True)
         await run_close_confirm(stock_bases, baselines, feed, loop, today)
         return
 
+    # 同期量基準缺漏或過期（例如前一晚 baseline 失敗）：在背景用富邦 1 分 K 自動補算，完成後自動啟用 B 條件
+    rebuild_task = None
+    if not baselines:
+        print("[同期量基準] 缺漏或過期，啟動背景自動補算", flush=True)
+        rebuild_task = asyncio.ensure_future(
+            loop.run_in_executor(None, build_baseline, stock_bases, feed, "雷達自動補算"))
+        bl_text += "\n⏳ 已啟動自動補算（約 15～20 分鐘），完成前不會有盤中訊號，完成後自動啟用"
+
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v50】即時監控啟動（A+B+C 短線波段）</b>",
+        "📡 <b>【飆股雷達 v52】即時監控啟動（A+B+C 短線波段）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
-        f"全台股 {len(stock_bases)} 檔預載，5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
+        f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
         "A：A1 均線突破首日（昨收 < 均線最高、現價同時站上 MA5/10/20）或 A2 開盤 > 昨高 ×1.02",
         f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE} 且 ≥ 昨日同期量",
@@ -1411,6 +1695,7 @@ async def main_async() -> None:
 
     fail_streak, fail_alerted, fail_started = 0, False, None
     polls = 0
+    last_total, stall_polls, stall_alerted, stall_started = None, 0, False, None
     funnel = {"total": 0, "red": 0, "chg": 0, "a": 0, "b": 0, "c": 0}
     try:
         while True:
@@ -1426,6 +1711,28 @@ async def main_async() -> None:
             if current.hour * 60 + current.minute > SIGNAL_END_MINUTES:
                 await asyncio.sleep(10)            # 13:30 後不再發訊號，等到 13:35 做收盤確認
                 continue
+
+            if rebuild_task is not None and rebuild_task.done():
+                task, rebuild_task = rebuild_task, None
+                try:
+                    built = task.result()
+                except Exception as exc:
+                    built = False
+                    print(f"[同期量基準] 自動補算例外：{type(exc).__name__}: {exc}", flush=True)
+                    await loop.run_in_executor(None, send_telegram, f"❌ <b>【飆股雷達】</b> 同期量基準自動補算失敗：{type(exc).__name__}: {exc}")
+                if built:
+                    new_baselines, new_text = load_baseline(stock_bases)
+                    baselines.clear()
+                    baselines.update(new_baselines)
+                    print(f"[同期量基準] 自動補算完成並載入：{new_text}", flush=True)
+                    missed = ""
+                    if minutes_since_open(now_tw()) > EVAL_START_MINUTE:
+                        missed = f"\n開盤後到現在（約 {minutes_since_open(now_tw()):.0f} 分鐘）的訊號已錯過，請自行對照看盤軟體。"
+                    await loop.run_in_executor(
+                        None, send_telegram,
+                        f"✅ <b>【飆股雷達】</b> 同期量基準已補算完成並啟用，現在開始判斷 B 條件。\n{new_text}{missed}")
+                else:
+                    print("[同期量基準] 自動補算失敗，今日不會有盤中訊號（收盤確認仍會執行）", flush=True)
 
             started = time.time()
             try:
@@ -1467,6 +1774,29 @@ async def main_async() -> None:
                 await loop.run_in_executor(None, send_telegram, f"ℹ️ <b>【飆股雷達】</b> 快照日期不是今天（{today_str}），判定今日休市，監控結束。")
                 return
 
+            total_vol, summary = snapshot_summary(snap, current)
+            delta = 0.0 if last_total is None else total_vol - last_total
+            x_now = minutes_since_open(current)
+            in_window = STALL_CHECK_FROM_MINUTE <= x_now <= STALL_CHECK_UNTIL_MINUTE
+            if last_total is not None and in_window and delta <= 0:
+                stall_polls += 1
+                stall_started = stall_started or current
+            elif last_total is not None and delta > 0:
+                if stall_alerted:
+                    lasted = (current - stall_started).total_seconds() if stall_started else 0
+                    print(f"[快照] 資料恢復更新（凍結約 {lasted:.0f} 秒）", flush=True)
+                    await loop.run_in_executor(
+                        None, send_telegram,
+                        f"✅ <b>【飆股雷達】快照資料已恢復更新</b>\n凍結約 {lasted / 60:.1f} 分鐘，這段時間的訊號可能已錯過，請自行對照看盤軟體。")
+                stall_polls, stall_alerted, stall_started = 0, False, None
+            if stall_polls >= STALL_ALERT_POLLS and not stall_alerted:
+                stall_alerted = True
+                await loop.run_in_executor(
+                    None, send_telegram,
+                    f"⚠️ <b>【飆股雷達】快照資料疑似沒有更新</b>\n全市場累積量連續 {stall_polls} 輪（約 {stall_polls * POLL_INTERVAL / 60:.1f} 分鐘）完全沒變。\n"
+                    f"{summary}\n可能是行情服務異常或休市，請對照看盤軟體；這段期間的訊號不可信。")
+            last_total = total_vol
+
             signals = process_poll(snap, stock_bases, baselines, current, funnel)
             sent = 0
             for sig in sorted(signals, key=lambda s: -s["val"]):
@@ -1485,7 +1815,10 @@ async def main_async() -> None:
 
             polls += 1
             elapsed = time.time() - started
-            print(f"[{current.strftime('%H:%M:%S')}] 第 {polls} 輪：快照 {len(snap['rows'])} 檔，新訊號 {sent}，今日累計 {len(STATE['signals'])}，耗時 {elapsed:.2f}s", flush=True)
+            print(f"[{current.strftime('%H:%M:%S')}] 第 {polls} 輪：快照 {len(snap['rows'])} 檔，新訊號 {sent}，今日累計 {len(STATE['signals'])}，耗時 {elapsed:.2f}s"
+                  f"｜{summary}（{delta:+,.0f}）", flush=True)
+            if polls % 4 == 1:
+                print(f"    樣本 {sample_line(snap)}", flush=True)
             if polls % 20 == 0:
                 print(f"[漏斗/最近 20 輪累計人次] 判斷 {funnel['total']} → 現價>開盤 {funnel['red']} → 漲幅區間 {funnel['chg']} "
                       f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']}", flush=True)
