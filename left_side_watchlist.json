@@ -1,0 +1,187 @@
+{
+ "asof": "2026-10-08",
+ "generated_at": "2026-10-08T17:46:40+08:00",
+ "count": 18,
+ "stocks": {
+  "3706": {
+   "name": "神達",
+   "strategy": "土洋同買",
+   "added": "2026-10-08",
+   "days_in": 1,
+   "tangle_pct": 0.86,
+   "tangle_now": 0.86,
+   "tangle_streak": 3,
+   "market": "上市"
+  },
+  "8464": {
+   "name": "億豐",
+   "strategy": "土洋同買",
+   "added": "2026-10-07",
+   "days_in": 2,
+   "tangle_pct": 1.98,
+   "tangle_now": 1.7,
+   "tangle_streak": 27,
+   "market": "上市"
+  },
+  "5876": {
+   "name": "上海商銀",
+   "strategy": "外資佈局",
+   "added": "2026-10-06",
+   "days_in": 3,
+   "tangle_pct": 0.42,
+   "tangle_now": 0.19,
+   "tangle_streak": 6,
+   "market": "上市"
+  },
+  "2892": {
+   "name": "第一金",
+   "strategy": "土洋同買",
+   "added": "2026-10-06",
+   "days_in": 3,
+   "tangle_pct": 1.31,
+   "tangle_now": 1.47,
+   "tangle_streak": 5,
+   "market": "上市"
+  },
+  "2884": {
+   "name": "玉山金",
+   "strategy": "土洋同買",
+   "added": "2026-10-06",
+   "days_in": 3,
+   "tangle_pct": 0.85,
+   "tangle_now": 0.79,
+   "tangle_streak": 6,
+   "market": "上市"
+  },
+  "6176": {
+   "name": "瑞儀",
+   "strategy": "土洋同買",
+   "added": "2026-10-06",
+   "days_in": 3,
+   "tangle_pct": 0.23,
+   "tangle_now": 0.32,
+   "tangle_streak": 20,
+   "market": "上市"
+  },
+  "2851": {
+   "name": "中再保",
+   "strategy": "土洋同買",
+   "added": "2026-10-06",
+   "days_in": 3,
+   "tangle_pct": 1.5,
+   "tangle_now": 0.5,
+   "tangle_streak": 7,
+   "market": "上市"
+  },
+  "8011": {
+   "name": "台通",
+   "strategy": "土洋同買",
+   "added": "2026-10-05",
+   "days_in": 4,
+   "tangle_pct": 1.42,
+   "tangle_now": 3.43,
+   "tangle_streak": 0,
+   "market": "上市"
+  },
+  "3005": {
+   "name": "神基",
+   "strategy": "土洋同買",
+   "added": "2026-10-05",
+   "days_in": 4,
+   "tangle_pct": 1.07,
+   "tangle_now": 0.75,
+   "tangle_streak": 19,
+   "market": "上市"
+  },
+  "8926": {
+   "name": "台汽電",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 0.93,
+   "tangle_now": 1.32,
+   "tangle_streak": 9,
+   "market": "上市"
+  },
+  "2377": {
+   "name": "微星",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 0.39,
+   "tangle_now": 1.59,
+   "tangle_streak": 14,
+   "market": "上市"
+  },
+  "3024": {
+   "name": "憶聲",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 1.74,
+   "tangle_now": 3.37,
+   "tangle_streak": 0,
+   "market": "上市"
+  },
+  "3078": {
+   "name": "僑威",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 1.57,
+   "tangle_now": 2.05,
+   "tangle_streak": 0,
+   "market": "上櫃"
+  },
+  "1312": {
+   "name": "國喬",
+   "strategy": "外資佈局",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 0.65,
+   "tangle_now": 1.07,
+   "tangle_streak": 12,
+   "market": "上市"
+  },
+  "6215": {
+   "name": "和椿",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 0.32,
+   "tangle_now": 0.61,
+   "tangle_streak": 22,
+   "market": "上市"
+  },
+  "6214": {
+   "name": "精誠",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 0.9,
+   "tangle_now": 0.21,
+   "tangle_streak": 8,
+   "market": "上市"
+  },
+  "2609": {
+   "name": "陽明",
+   "strategy": "土洋同買+外資佈局",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": 1.5,
+   "tangle_now": 0.55,
+   "tangle_streak": 8,
+   "market": "上市"
+  },
+  "2427": {
+   "name": "三商電",
+   "strategy": "土洋同買",
+   "added": "2026-10-02",
+   "days_in": 5,
+   "tangle_pct": null,
+   "tangle_now": 0.99,
+   "tangle_streak": 5,
+   "market": "上市"
+  }
+ }
+}
