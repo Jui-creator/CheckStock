@@ -1,7 +1,8 @@
 name: 同期量基準盤後計算
 on:
-  # 每個交易日收盤後（建議 17:00 以後）執行一次；可由 Google Apps Script 在 18:00~19:00 觸發，
-  # 也可到 Actions 頁面點「Run workflow」手動執行。第一次使用請先手動跑一次。
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚觸發（建議 18:00~19:00），
+  # 也可到 Actions 頁面點「Run workflow」手動執行。
+  # 產出 volume_baseline.json（同期量基準）與 stock_bases.json（歷史基底快取），兩個一起 commit 回 repo。
   workflow_dispatch:
 permissions:
   contents: write
@@ -30,6 +31,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
+      - name: 還原產業鏈快取
+        uses: actions/cache/restore@v4
+        with:
+          path: ic_sector_cache.json
+          key: ic-sector-${{ github.run_id }}
+          restore-keys: |
+            ic-sector-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
       - name: 計算同期量基準
@@ -44,14 +52,43 @@ jobs:
       - name: 刪除憑證
         if: always()
         run: rm -f fubon.p12
+      - name: 儲存產業鏈快取
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ic_sector_cache.json
+          key: ic-sector-${{ github.run_id }}
       # 基準檔 commit 回 repo，隔天雷達（daily.yml）checkout 後讀取。
+      # push 前先 pull --rebase --autostash，並重試 3 次，避免和雷達的 commit 衝突；3 次都失敗才算失敗。
       - name: 儲存基準回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add volume_baseline.json
+          git add volume_baseline.json stock_bases.json
           git diff --staged --quiet && exit 0
           git commit -m "更新同期量基準 $(date '+%Y-%m-%d')"
-          git pull --rebase
-          git push
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            echo "push 第 $i 次失敗，5 秒後重試"
+            sleep 5
+          done
+          exit 1
+      # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
+      - name: 失敗通知
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "沒有設定 Telegram Secrets，略過通知"
+            exit 0
+          fi
+          TEXT=$(printf '❌ 【飆股雷達】%s 執行失敗、逾時或被取消\n時間：%s\n請查看：%s' \
+            "$WORKFLOW_NAME" "$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M')" "$RUN_URL")
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" > /dev/null || echo "Telegram 通知送出失敗"
