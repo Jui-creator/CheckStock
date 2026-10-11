@@ -1,38 +1,34 @@
 name: 飆股雷達每日自動掃描
-
 on:
-  # 只保留手動觸發：到 Actions 頁面點「Run workflow」執行。
+  # 只保留手動觸發：到 Actions 頁面點「Run workflow」執行（建議 08:30～08:55 之間啟動，程式會自己等到 09:00）。
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: feigu-radar-daily
   cancel-in-progress: false
-
 env:
   PYTHONUNBUFFERED: "1"
-
 jobs:
   radar:
     runs-on: ubuntu-latest
     timeout-minutes: 420
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: 設定 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: 安裝套件
+      - name: 檢查 SDK 檔案
+        run: |
+          ls -la vendor/
+          ls vendor/fubon_neo-*.whl
+      - name: 安裝套件與富邦 SDK
         run: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
-
+          pip install vendor/fubon_neo-*.whl
       - name: 還原產業鏈快取
         uses: actions/cache/restore@v4
         with:
@@ -40,23 +36,29 @@ jobs:
           key: ic-sector-${{ github.run_id }}
           restore-keys: |
             ic-sector-
-
+      - name: 還原憑證
+        run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
       - name: 執行飆股雷達
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FUBON_ID: ${{ secrets.FUBON_ID }}
+          FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
+          FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+          # DEBUG_CODES: "2330,2317"   # 想看特定股票每輪的判斷數字時，取消註解並填代號
         run: |
           python -u radar.py
-
+      - name: 刪除憑證
+        if: always()
+        run: rm -f fubon.p12
       - name: 儲存產業鏈快取
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
-
-      # 只 commit stock_states.json。
-      # 【v26】push 前先 pull --rebase，避免和左側潛力庫的 commit 衝突而推送失敗。
+      # 只 commit stock_states.json（當天已觸發名單，程式中斷重跑時不會重複通知）。
+      # push 前先 pull --rebase，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
@@ -67,13 +69,12 @@ jobs:
           git commit -m "更新飆股雷達狀態 $(date '+%Y-%m-%d')"
           git pull --rebase || true
           git push || true
-
       - name: 上傳 CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: radar-report
           path: |
-            watchlist_snapshot.csv
             signals_today.csv
+            close_confirm.csv
           if-no-files-found: ignore
