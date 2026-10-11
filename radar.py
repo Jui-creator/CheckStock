@@ -1,25 +1,30 @@
-"""飆股雷達 v52：1～2 週短線波段「A + B + C」進場策略（富邦 Neo API 即時行情，不再使用 MIS）。
-
-【進場條件】09:05～13:30 持續輪詢，同時滿足 A + B + C 就發 Telegram（同一檔同一天只發一次）：
-  A（二擇一）
+"""飆股雷達 v53：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+【進場條件】09:15～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
+            （同一檔同一天只發一次）：
+  A（三擇一，滿足任一項即可）
     A1 均線突破首日：昨收 < max(MA5, MA10, MA20)，且現價同時 > MA5、MA10、MA20（MA 含今日現價）。
     A2 強勢跳空：今日開盤 > 昨日最高價 × 1.02。
+    A3 均線糾結突破：
+         壓縮期  昨日 MA5/MA10/MA20 三者「最高與最低」的差距 ≤ 3%（A3_SQUEEZE_PCT）。
+         表態期  現價突破糾結均線群的高點（昨日與今日 MA5/10/20 中最高者）。量能由 B 條件把關。
   B 主力爆量（同期比較法，兩項都要成立）
     B1 目前累積量 ≥ 前 5 日「同時間」累積量平均（每個時間點排除最大的一天）× 1.5
     B2 目前累積量 ≥ 昨日「同時間」累積量
     （同期曲線由 baseline.py 每晚用富邦 1 分 K 計算，存成 volume_baseline.json）
-  C 流動性與熱度
+  C 流動性與熱度（全部成立）
     C1 5 日均量 ≥ 1,000 張
     C2 預估成交額 > 6 億（目前成交額 × 全日量 / 同時間量，用同一條同期曲線推算，不用 U 型經驗曲線）
     C3 現價 > 今日開盤（拒絕開高走低）
     C4 漲幅 +2% ~ +6%（用富邦快照的 changePercent，除權息日也正確）
-
+【實戰防禦】
+  ① 09:15 才開始判斷：避開 09:00～09:15 集合競價搓合量釋放的混亂期。
+  ② 二次確認（Double-Confirmation）：某檔在某一輪首次符合 A+B+C，先放進「待確認觀察池」，
+     下一輪（約 15～30 秒後）必須再次同時符合才發通知；下一輪沒再符合就移出觀察池，過濾點火後撤單的假突破。
 【通知】
-  盤中：符合 A+B+C 立即通知，並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
+  盤中：二次確認通過立即通知，並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
   收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，回報「今日共有 X 檔符合」、大盤 MA20 狀態，
         並列出「盤中觸發但收盤未通過」的股票與原因，另存 close_confirm.csv。
-  出場、停損、持倉追蹤都不做，由你自行判斷。
-
+  出場、停損、持倉追蹤都不做，由你自行判斷（第一階段收盤跌破 MA5 減碼一半、第二階段收盤跌破 MA10 清倉）。
 【檔案】
   stock_states.json     當日已觸發的股票與訊號紀錄（daily.yml 會 commit 回 repo；換日自動重置）
   volume_baseline.json  同期量基準（baseline.py 每晚產生；缺檔或基準日過期時，雷達啟動後會自動補算）
@@ -28,7 +33,6 @@
   ic_sector_cache.json  櫃買產業價值鏈快取（actions/cache）
   signals_today.csv     今日盤中訊號
   close_confirm.csv     收盤確認明細
-
 【環境變數】TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS
             （憑證檔 fubon.p12 由 workflow 還原到工作目錄，可用 FUBON_CERT_PATH 改路徑）
             DEBUG_CODES=2330,2317（可選，逗號分隔；盤中每輪印出這幾檔的判斷數字）
@@ -69,6 +73,7 @@ DEBUG_STOCK_CODES = {c.strip() for c in os.environ.get("DEBUG_CODES", "").split(
 
 # ---- 進場條件 ----
 GAP_RATIO = 1.02                    # A2：開盤 > 昨高 × 1.02
+A3_SQUEEZE_PCT = 3.0                # A3：昨日 MA5/10/20 最高與最低的差距（%）上限（SOP：2%～3% 以內）
 VOL_SURGE = 1.5                     # B1：累積量 ≥ 5 日同期均量 × 1.5
 VS_YEST_RATIO = 1.0                 # B2：累積量 ≥ 昨日同時間累積量 × 1.0
 MIN_VOL5_LOTS = 1000                # C1：5 日均量（張）
@@ -76,10 +81,13 @@ MIN_EST_TURNOVER = 600_000_000      # C2：預估成交額（元）
 CHG_MIN, CHG_MAX = 2.0, 6.0         # C4：漲幅區間（%）
 
 # ---- 防雜訊（早盤集合競價量一次進來、基準量太小時，同期比較會失真）----
-EVAL_START_MINUTE = 5               # 開盤後第 5 分鐘（09:05）才開始判斷
+EVAL_START_MINUTE = 15              # 開盤後第 15 分鐘（09:15）才開始判斷，避開集合競價搓合量釋放的混亂期
 MIN_BASELINE_CUM = 50               # 同時間 5 日均量低於 50 張就不判斷
 SCALE_CAP = 15.0                    # 預估成交額的放大倍數上限（全日量 / 同時間量）
 DAILY_SIGNAL_CAP = 0                # 每日盤中訊號上限（0 = 不限）
+# ---- 二次確認（Double-Confirmation）----
+CONFIRM_MIN_GAP_SECONDS = 10        # 兩次符合至少相隔幾秒（避免同一份快照被重複計成兩次）
+CONFIRM_MAX_GAP_SECONDS = 45        # 超過這麼久才再次符合，就不算「下一次掃描」，重新當成首次
 
 # ---- 輪詢 ----
 POLL_INTERVAL = 15                  # 秒；富邦快照上限 300 次/分，每輪只打 2 次（上市、上櫃）
@@ -152,6 +160,7 @@ UNRELIABLE_MARKETS = set()
 HIGH_FALLBACK = {"rows": 0}         # 官方表格沒有「最高價」欄位、改用收盤價代替的筆數
 ALERT_QUEUE = []
 STATE = {"date": "", "triggered": {}, "signals": []}
+PENDING = {}                         # 待確認觀察池：{代號: {"time": datetime, "price": float, "kind": str}}（只存在記憶體）
 
 
 # =========================
@@ -1188,18 +1197,35 @@ def realtime_mas(base: dict, price: float):
     return ((base["sum_4"] + price) / 5, (base["sum_9"] + price) / 10, (base["sum_19"] + price) / 20)
 
 
+def a3_check(base: dict, price: float, mas):
+    """A3 均線糾結突破。回傳 (a3, 糾結幅度%, 均線群高點, 壓縮期成立, 表態期成立)。
+    壓縮期：昨日 MA5/10/20 的（最高 / 最低 - 1）≤ A3_SQUEEZE_PCT；
+    表態期：現價 > 均線群高點（昨日與今日 MA5/10/20 中最高者）。"""
+    prev = (base["true_ma5"], base["true_ma10"], base["true_ma20"])
+    lo, hi_prev = min(prev), max(prev)
+    spread = (hi_prev / lo - 1) * 100 if lo > 0 else None
+    squeezed = spread is not None and spread <= A3_SQUEEZE_PCT
+    cluster_high = max(hi_prev, *mas)
+    broke = price > cluster_high
+    return (squeezed and broke), spread, cluster_high, squeezed, broke
+
+
 def a_conditions(base: dict, price: float, open_: float):
-    """回傳 (a1, a2, (ma5, ma10, ma20), a1_prev, a1_now)。
-    A1 = 昨收 < max(昨日 MA5/10/20)，且現價同時 > 今日 MA5/10/20；A2 = 開盤 > 昨高 × 1.02。"""
-    ma5, ma10, ma20 = realtime_mas(base, price)
+    """回傳 (a1, a2, a3, (ma5, ma10, ma20), a1_prev, a1_now, a3_info)。
+    A1 = 昨收 < max(昨日 MA5/10/20)，且現價同時 > 今日 MA5/10/20；A2 = 開盤 > 昨高 × 1.02；
+    A3 = 昨日 MA5/10/20 糾結（差距 ≤ A3_SQUEEZE_PCT）且現價突破均線群高點。"""
+    mas = realtime_mas(base, price)
+    ma5, ma10, ma20 = mas
     a1_prev = base["yest_close"] < max(base["true_ma5"], base["true_ma10"], base["true_ma20"])
     a1_now = price > ma5 and price > ma10 and price > ma20
     a2 = open_ > base["yest_high"] * GAP_RATIO
-    return (a1_prev and a1_now), a2, (ma5, ma10, ma20), a1_prev, a1_now
+    a3, spread, cluster_high, squeezed, broke = a3_check(base, price, mas)
+    a3_info = {"spread": spread, "high": cluster_high, "squeezed": squeezed, "broke": broke}
+    return (a1_prev and a1_now), a2, a3, mas, a1_prev, a1_now, a3_info
 
 
-def _kind(a1: bool, a2: bool) -> str:
-    return "A1+A2" if (a1 and a2) else ("A1" if a1 else "A2")
+def _kind(a1: bool, a2: bool, a3: bool = False) -> str:
+    return "+".join(name for name, flag in (("A1", a1), ("A2", a2), ("A3", a3)) if flag)
 
 
 def chg_pct(base: dict, row: dict, price: float):
@@ -1245,8 +1271,8 @@ def evaluate_intraday(base: dict, bl: dict, row: dict, x: float, funnel: dict):
         return None
     funnel["chg"] += 1
     # A
-    a1, a2, (ma5, ma10, ma20), _, _ = a_conditions(base, price, open_)
-    if not (a1 or a2):
+    a1, a2, a3, (ma5, ma10, ma20), _, _, a3_info = a_conditions(base, price, open_)
+    if not (a1 or a2 or a3):
         return None
     funnel["a"] += 1
     # B 同期比較
@@ -1269,8 +1295,9 @@ def evaluate_intraday(base: dict, bl: dict, row: dict, x: float, funnel: dict):
     funnel["c"] += 1
     return {
         "code": base["code"], "name": base["name"], "market": base["market"], "industry": base["industry"],
-        "kind": _kind(a1, a2), "price": price, "open": open_, "chg": chg,
+        "kind": _kind(a1, a2, a3), "price": price, "open": open_, "chg": chg,
         "yest_close": base["yest_close"], "yest_high": base["yest_high"],
+        "a3_spread": a3_info["spread"], "a3_high": a3_info["high"],
         "prev_ma_max": max(base["true_ma5"], base["true_ma10"], base["true_ma20"]),
         "vol": vol, "avg_now": avg_now, "yest_now": yest_now,
         "ratio_avg": vol / avg_now, "ratio_yest": (vol / yest_now) if yest_now > 0 else None,
@@ -1285,7 +1312,7 @@ def debug_line(base: dict, bl, row: dict, x: float) -> str:
     if not price or not open_:
         return f"[診斷 {base['code']} {base['name']}] 無成交價或開盤價"
     chg = chg_pct(base, row, price)
-    a1, a2, mas, a1p, a1n = a_conditions(base, price, open_)
+    a1, a2, a3, mas, a1p, a1n, a3i = a_conditions(base, price, open_)
     vol = _f(row.get("tradeVolume")) or 0.0
     val = _f(row.get("tradeValue")) or 0.0
     if bl:
@@ -1296,7 +1323,7 @@ def debug_line(base: dict, bl, row: dict, x: float) -> str:
     else:
         btxt = "無同期量基準"
     return (f"[診斷 {base['code']} {base['name']}] 價 {price}｜開 {open_}｜漲幅 {chg if chg is None else round(chg, 2)}%"
-            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
+            f"｜A1 {a1}（昨收<均線最高 {a1p}，現價站上 {a1n}）｜A2 {a2}｜A3 {a3}（昨日糾結 {'無' if a3i['spread'] is None else round(a3i['spread'], 2)}%，群高 {a3i['high']:.2f}）｜MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜{btxt}")
 
 
 def check_close(base: dict, bl, row: dict):
@@ -1308,7 +1335,7 @@ def check_close(base: dict, bl, row: dict):
     vol = _f(row.get("tradeVolume")) or 0.0
     val = _f(row.get("tradeValue")) or 0.0
     chg = chg_pct(base, row, price)
-    a1, a2, (ma5, ma10, ma20), a1_prev, a1_now = a_conditions(base, price, open_)
+    a1, a2, a3, (ma5, ma10, ma20), a1_prev, a1_now, a3_info = a_conditions(base, price, open_)
     # B：全日量。有同期量基準就用同一個資料來源（富邦 1 分 K 加總），沒有才用官方資料
     if bl:
         full_avg, yest_full = bl["avg"][-1], bl["yest"][-1]
@@ -1320,7 +1347,7 @@ def check_close(base: dict, bl, row: dict):
     c2 = val > MIN_EST_TURNOVER
     c3 = price > open_
     c4 = chg is not None and CHG_MIN <= chg <= CHG_MAX
-    a_ok, b_ok, c_ok = (a1 or a2), (b1 and b2), (c1 and c2 and c3 and c4)
+    a_ok, b_ok, c_ok = (a1 or a2 or a3), (b1 and b2), (c1 and c2 and c3 and c4)
     ratio_avg = vol / full_avg if full_avg > 0 else 0.0
     ratio_yest = vol / yest_full if yest_full > 0 else 0.0
     reasons = []
@@ -1331,6 +1358,11 @@ def check_close(base: dict, bl, row: dict):
         elif not a1_now:
             parts.append(f"A1：收盤 {price:.2f} 未同時站上 MA5/10/20（{ma5:.2f}/{ma10:.2f}/{ma20:.2f}）")
         parts.append(f"A2：開盤 {open_:.2f} 未超過昨高×1.02（{base['yest_high'] * GAP_RATIO:.2f}）")
+        if not a3_info["squeezed"]:
+            sp = a3_info["spread"]
+            parts.append(f"A3：昨日 MA 糾結幅度 {'無資料' if sp is None else f'{sp:.2f}%'}（需 ≤ {A3_SQUEEZE_PCT:g}%）")
+        else:
+            parts.append(f"A3：收盤 {price:.2f} 未突破均線群高點 {a3_info['high']:.2f}")
         reasons.append("；".join(parts))
     if not b1:
         reasons.append(f"B：全日量只有 5 日均量的 {ratio_avg:.2f} 倍（需 ≥ {VOL_SURGE}）")
@@ -1346,7 +1378,7 @@ def check_close(base: dict, bl, row: dict):
         reasons.append(f"C：收盤漲幅 {'無資料' if chg is None else f'{chg:+.1f}%'} 不在 +{CHG_MIN:.0f}%～+{CHG_MAX:.0f}%")
     return {
         "code": base["code"], "name": base["name"], "market": base["market"], "industry": base["industry"],
-        "kind": _kind(a1, a2) if a_ok else "", "price": price, "open": open_, "chg": chg,
+        "kind": _kind(a1, a2, a3) if a_ok else "", "price": price, "open": open_, "chg": chg,
         "yest_close": base["yest_close"], "yest_high": base["yest_high"],
         "vol": vol, "full_avg": full_avg, "yest_full": yest_full, "ratio_avg": ratio_avg, "ratio_yest": ratio_yest,
         "val": val, "ma5": ma5, "ma10": ma10, "ma20": ma20,
@@ -1358,7 +1390,7 @@ def check_close(base: dict, bl, row: dict):
 # =========================
 # 通知文字與 CSV
 # =========================
-SIGNAL_FIELDS = ["時間", "代號", "名稱", "市場", "型態", "現價", "漲幅(%)", "開盤", "昨收", "昨高",
+SIGNAL_FIELDS = ["時間", "首次符合時間", "代號", "名稱", "市場", "型態", "現價", "漲幅(%)", "開盤", "昨收", "昨高",
                  "累積量(張)", "5日同期均量(張)", "5日同期倍數", "昨日同期倍數",
                  "已成交額(億)", "預估成交額(億)", "MA5", "MA10", "MA20", "MA5減碼參考價", "族群"]
 
@@ -1368,12 +1400,15 @@ def _mkt_name(mkt: str) -> str:
 
 
 def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
-    title = {"A1": "A1 均線突破首日", "A2": "A2 強勢跳空", "A1+A2": "A1 均線突破首日 + A2 強勢跳空"}[sig["kind"]]
+    names = {"A1": "A1 均線突破首日", "A2": "A2 強勢跳空", "A3": "A3 均線糾結突破"}
+    title = " + ".join(names[k] for k in sig["kind"].split("+"))
     lines = [f"🚀 <b>【進場訊號 A+B+C】{sig['code']} {sig['name']}</b>", f"• 型態：<b>{title}</b>"]
     if "A1" in sig["kind"]:
         lines.append(f"• A1：昨收 {sig['yest_close']:.2f} < 昨日均線最高 {sig['prev_ma_max']:.2f}，現價同時站上 MA5/10/20")
     if "A2" in sig["kind"]:
         lines.append(f"• A2：開盤 {sig['open']:.2f} > 昨高 {sig['yest_high']:.2f} × {GAP_RATIO}（{sig['yest_high'] * GAP_RATIO:.2f}）")
+    if "A3" in sig["kind"] and sig.get("a3_spread") is not None:
+        lines.append(f"• A3：昨日 MA5/10/20 糾結幅度 {sig['a3_spread']:.2f}%（≤ {A3_SQUEEZE_PCT:g}%），現價突破均線群高點 {sig['a3_high']:.2f}")
     ry = "無資料" if sig["ratio_yest"] is None else f"{sig['ratio_yest']:.2f} 倍"
     lines += [
         f"• 現價 <b>{sig['price']:.2f}</b>（{sig['chg']:+.1f}%）｜開盤 {sig['open']:.2f}｜昨收 {sig['yest_close']:.2f}｜昨高 {sig['yest_high']:.2f}",
@@ -1382,6 +1417,7 @@ def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
         f"• MA5/10/20：{sig['ma5']:.2f} / {sig['ma10']:.2f} / {sig['ma20']:.2f}",
         f"• ✂️ MA5 減碼參考價：<b>{sig['ma5_cut']:.2f}</b>（前 4 日收盤均價；今日收盤跌破此價 = 收盤跌破 MA5）",
         f"• 族群：{sig['industry'] or '未分類'}｜{_mkt_name(sig['market'])}",
+        f"• ✅ 二次確認：首次符合 {sig.get('first_time', '-')}（{sig.get('first_price', sig['price']):.2f}）→ 再次符合 {now.strftime('%H:%M:%S')}（{sig['price']:.2f}）",
         f"• 今日第 {n_today} 則｜時間：{now.strftime('%H:%M:%S')}",
     ]
     return "\n".join(lines)
@@ -1389,7 +1425,7 @@ def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
 
 def signal_row(sig: dict, now: datetime) -> dict:
     return {
-        "時間": now.strftime("%H:%M:%S"), "代號": sig["code"], "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
+        "時間": now.strftime("%H:%M:%S"), "首次符合時間": sig.get("first_time", ""), "代號": sig["code"], "名稱": sig["name"], "市場": _mkt_name(sig["market"]),
         "型態": sig["kind"], "現價": round(sig["price"], 2), "漲幅(%)": round(sig["chg"], 2),
         "開盤": round(sig["open"], 2), "昨收": round(sig["yest_close"], 2), "昨高": round(sig["yest_high"], 2),
         "累積量(張)": int(sig["vol"]), "5日同期均量(張)": int(sig["avg_now"]),
@@ -1546,10 +1582,40 @@ async def _prepare_stock_bases(include_today=False):
     return stock_bases
 
 
+def apply_double_confirm(candidates: list, now: datetime) -> list:
+    """二次確認：本輪符合 A+B+C 的股票（candidates）與上一輪的待確認觀察池比對。
+    - 上一輪在池中、這一輪又符合，且間隔 CONFIRM_MIN_GAP～CONFIRM_MAX_GAP 秒 → 確認通過，回傳。
+    - 首次符合（或間隔過久）→ 放進觀察池，等下一輪。
+    - 上一輪在池中、這一輪沒再符合 → 移出觀察池（Whipsaw 假突破）。"""
+    confirmed, new_pending = [], {}
+    for sig in candidates:
+        code = sig["code"]
+        prev = PENDING.get(code)
+        if prev is not None:
+            gap = (now - prev["time"]).total_seconds()
+            if gap < CONFIRM_MIN_GAP_SECONDS:            # 太快：同一份資料，不算第二次，維持原本的觀察紀錄
+                new_pending[code] = prev
+                continue
+            if gap <= CONFIRM_MAX_GAP_SECONDS:           # 下一次掃描再次符合 → 確認
+                sig["first_time"] = prev["time"].strftime("%H:%M:%S")
+                sig["first_price"] = prev["price"]
+                confirmed.append(sig)
+                continue
+        new_pending[code] = {"time": now, "price": sig["price"], "kind": sig["kind"]}
+        print(f"[待確認] {code} {sig['name']}（{sig['kind']}，{sig['chg']:+.1f}%，量 {sig['ratio_avg']:.2f}x）"
+              f"首次符合，等下一輪再確認", flush=True)
+    dropped = [c for c in PENDING if c not in new_pending and c not in {s['code'] for s in confirmed}]
+    for c in dropped:
+        print(f"[待確認] {c} 下一輪沒有再符合，移出觀察池（過濾假突破）", flush=True)
+    PENDING.clear()
+    PENDING.update(new_pending)
+    return confirmed
+
+
 def process_poll(snap: dict, bases: dict, baselines: dict, now: datetime, funnel: dict) -> list:
-    """逐檔判斷，回傳這一輪新符合的訊號（已觸發過的不再判斷）。"""
+    """逐檔判斷，回傳這一輪「通過二次確認」的新訊號（已觸發過的不再判斷）。"""
     xs = {mkt: snapshot_minutes(meta, now) for mkt, meta in snap["meta"].items()}
-    out = []
+    candidates = []
     for code, row in snap["rows"].items():
         base = bases.get(code)
         if base is None or not base["liquid"] or base["market"] in UNRELIABLE_MARKETS:
@@ -1563,8 +1629,11 @@ def process_poll(snap: dict, bases: dict, baselines: dict, now: datetime, funnel
         funnel["total"] += 1
         sig = evaluate_intraday(base, bl, row, x, funnel)
         if sig:
-            out.append(sig)
-    return out
+            candidates.append(sig)
+    funnel["pend"] += len(candidates)
+    confirmed = apply_double_confirm(candidates, now)       # 每一輪都要呼叫（沒有候選時也要清空觀察池）
+    funnel["conf"] += len(confirmed)
+    return confirmed
 
 
 async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: date_cls) -> bool:
@@ -1627,7 +1696,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v52：1～2 週短線波段 A+B+C（富邦 Neo API）", flush=True)
+    print("飆股雷達 v53：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -1678,14 +1747,14 @@ async def main_async() -> None:
 
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v52】即時監控啟動（A+B+C 短線波段）</b>",
+        "📡 <b>【飆股雷達 v53】即時監控啟動（A+B+C＋二次確認）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
         f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
-        "A：A1 均線突破首日（昨收 < 均線最高、現價同時站上 MA5/10/20）或 A2 開盤 > 昨高 ×1.02",
+        f"A（三擇一）：A1 均線突破首日｜A2 開盤 > 昨高 ×{GAP_RATIO}｜A3 均線糾結（MA5/10/20 差距 ≤ {A3_SQUEEZE_PCT:g}%）後突破群高點",
         f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE} 且 ≥ 昨日同期量",
         f"C：預估成交額 > {MIN_EST_TURNOVER / 1e8:.0f} 億、現價 > 開盤、漲幅 +{CHG_MIN:.0f}%～+{CHG_MAX:.0f}%",
-        f"判斷時段 09:{EVAL_START_MINUTE:02d}～13:30，同一檔當天只通知一次；13:35 收盤確認",
+        f"判斷時段 09:{EVAL_START_MINUTE:02d}～13:30（避開集合競價）｜二次確認：連續兩輪掃描都符合才通知｜同一檔當天只通知一次｜13:35 收盤確認",
     ]
     if STATE["triggered"]:
         startup.append(f"續跑：今日已觸發 {len(STATE['triggered'])} 檔，不會重複通知")
@@ -1696,7 +1765,7 @@ async def main_async() -> None:
     fail_streak, fail_alerted, fail_started = 0, False, None
     polls = 0
     last_total, stall_polls, stall_alerted, stall_started = None, 0, False, None
-    funnel = {"total": 0, "red": 0, "chg": 0, "a": 0, "b": 0, "c": 0}
+    funnel = {"total": 0, "red": 0, "chg": 0, "a": 0, "b": 0, "c": 0, "pend": 0, "conf": 0}
     try:
         while True:
             current = now_tw()
@@ -1806,7 +1875,7 @@ async def main_async() -> None:
                 STATE["triggered"][sig["code"]] = {"time": current.strftime("%H:%M:%S"), "kind": sig["kind"], "price": sig["price"]}
                 STATE["signals"].append(signal_row(sig, current))
                 enqueue_alert(build_signal_message(sig, len(STATE["signals"]), current))
-                print(f"觸發 A+B+C：{sig['code']} {sig['name']}（{sig['kind']}，{sig['chg']:+.1f}%，量 {sig['ratio_avg']:.2f}x）", flush=True)
+                print(f"觸發 A+B+C（二次確認通過）：{sig['code']} {sig['name']}（{sig['kind']}，{sig['chg']:+.1f}%，量 {sig['ratio_avg']:.2f}x）", flush=True)
                 sent += 1
             if sent:
                 save_states()
@@ -1821,7 +1890,7 @@ async def main_async() -> None:
                 print(f"    樣本 {sample_line(snap)}", flush=True)
             if polls % 20 == 0:
                 print(f"[漏斗/最近 20 輪累計人次] 判斷 {funnel['total']} → 現價>開盤 {funnel['red']} → 漲幅區間 {funnel['chg']} "
-                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']}", flush=True)
+                      f"→ A {funnel['a']} → B {funnel['b']} → C(符合) {funnel['c']} → 進觀察池/再確認 {funnel['pend']} → 二次確認通過 {funnel['conf']}", flush=True)
                 funnel = {k: 0 for k in funnel}
             await asyncio.sleep(max(1.0, POLL_INTERVAL - elapsed))
     except asyncio.CancelledError:
