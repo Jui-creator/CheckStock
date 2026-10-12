@@ -5,13 +5,17 @@ on:
   # 程式啟動後會自己等到 09:00 才開始輪詢，13:35 收盤確認後結束。
   # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:35 約 335 分鐘，timeout 設 355 分鐘。
   workflow_dispatch:
+
 permissions:
   contents: write
+
 concurrency:
   group: feigu-radar-daily
   cancel-in-progress: false
+
 env:
   PYTHONUNBUFFERED: "1"
+
 jobs:
   radar:
     runs-on: ubuntu-latest
@@ -19,19 +23,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: 設定 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: 檢查 SDK 檔案
         run: |
           ls -la vendor/
           ls vendor/fubon_neo-*.whl
+
       - name: 安裝套件與富邦 SDK
         run: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
+
       - name: 還原產業鏈快取
         uses: actions/cache/restore@v4
         with:
@@ -39,8 +47,10 @@ jobs:
           key: ic-sector-${{ github.run_id }}
           restore-keys: |
             ic-sector-
+
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
+
       - name: 執行飆股雷達
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -51,25 +61,31 @@ jobs:
           # DEBUG_CODES: "2330,2317"   # 想看特定股票每輪的判斷數字時，取消註解並填代號
         run: |
           python -u radar.py
+
       - name: 刪除憑證
         if: always()
         run: rm -f fubon.p12
+
       - name: 儲存產業鏈快取
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
+
       # 要 commit 的檔案：
-      #   stock_states.json   當天已觸發名單（程式中斷重跑時不會重複通知）
+      #   stock_states.json    當天已觸發名單（程式中斷重跑時不會重複通知）
       #   volume_baseline.json 雷達開盤時若發現基準檔過期而自動補算，新檔也要存回 repo
+      #   signal_history.json  強勢歷史（收盤確認後更新，明天判斷「初次 / 拉回再發動 / 連續強勢」用）
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add stock_states.json volume_baseline.json || true
+          for f in stock_states.json volume_baseline.json signal_history.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
           git diff --staged --quiet && exit 0
           git commit -m "更新飆股雷達狀態 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
@@ -77,6 +93,7 @@ jobs:
             echo "push 第 $i 次失敗，5 秒後重試"
             sleep 5
           done || true
+
       - name: 上傳 CSV
         if: always()
         uses: actions/upload-artifact@v4
@@ -85,7 +102,9 @@ jobs:
           path: |
             signals_today.csv
             close_confirm.csv
+            signal_history.json
           if-no-files-found: ignore
+
       # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
       - name: 失敗通知
         if: failure() || cancelled()
