@@ -1,0 +1,69 @@
+name: 強勢歷史回算
+on:
+  # 只手動執行：Actions 頁面點「Run workflow」。
+  # 用官方 TWSE/TPEx 日資料回算過去 15 個交易日的收盤確認（A+B+C），重建 signal_history.json 並 commit 回 repo。
+  # 使用時機：第一次啟用強勢標籤、或某天收盤確認失敗導致歷史缺漏時。
+  # 建議交易日 15:30 以後執行（官方當日資料約 15:00 後齊全），約 3～5 分鐘。不需要富邦登入。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feigu-radar-daily        # 與雷達同一組，避免同時改 signal_history.json
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests aiohttp
+
+      - name: 回算強勢歷史
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u radar.py --backfill
+
+      - name: 儲存回 repo
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add signal_history.json
+          git diff --staged --quiet && exit 0
+          git commit -m "回算強勢歷史 $(date '+%Y-%m-%d')"
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            echo "push 第 $i 次失敗，5 秒後重試"
+            sleep 5
+          done
+          exit 1
+
+      - name: 失敗通知
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=❌ 【強勢歷史回算】執行失敗：${RUN_URL}" > /dev/null || true
