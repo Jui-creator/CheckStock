@@ -1,4 +1,4 @@
-"""飆股雷達 v54：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v55：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:05～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
   A（三擇一，滿足任一項即可）
@@ -26,7 +26,7 @@
   ② 二次確認（Double-Confirmation）：某檔在某一輪首次符合 A+B+C，先放進「待確認觀察池」，
      下一輪（約 15～30 秒後）必須再次同時符合才發通知；下一輪沒再符合就移出觀察池，過濾點火後撤單的假突破。
 【通知】
-  盤中：二次確認通過立即通知，並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
+  盤中：二次確認通過立即通知（一則訊息只含一檔股票，逐則送出、間隔 1 秒），並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
   收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，回報「今日共有 X 檔符合」、大盤 MA20 狀態，
         並列出「盤中觸發但收盤未通過」的股票與原因，另存 close_confirm.csv。
   出場、停損、持倉追蹤都不做，由你自行判斷（第一階段收盤跌破 MA5 減碼一半、第二階段收盤跌破 MA10 清倉）。
@@ -235,10 +235,17 @@ def minutes_since_open(t: datetime) -> float:
 # =========================
 # Telegram
 # =========================
+_SAFE_TAGS = ("b", "code")
+
+
 def _safe_html(text: str) -> str:
-    text = text.replace("<b>", "\x00B\x00").replace("</b>", "\x00/B\x00")
+    """只保留 <b>、<code> 兩種標籤，其他 < > & 一律跳脫（族群名稱裡的「>」也會被正確顯示）。"""
+    for i, tag in enumerate(_SAFE_TAGS):
+        text = text.replace(f"<{tag}>", f"\x00{i}O\x00").replace(f"</{tag}>", f"\x00{i}C\x00")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return text.replace("\x00B\x00", "<b>").replace("\x00/B\x00", "</b>")
+    for i, tag in enumerate(_SAFE_TAGS):
+        text = text.replace(f"\x00{i}O\x00", f"<{tag}>").replace(f"\x00{i}C\x00", f"</{tag}>")
+    return text
 
 
 def _send_telegram_chunk(message: str, retry: int = 3) -> bool:
@@ -317,13 +324,17 @@ def enqueue_alert(message: str) -> None:
     ALERT_QUEUE.append(message)
 
 
+ALERT_SEND_GAP = 1.0                 # 兩則個股通知之間間隔（秒），避免 Telegram 同一聊天室每秒限 1 則的限制
+
+
 async def flush_alerts(loop) -> None:
+    """一檔一則：佇列裡每則訊息獨立送出，不合併。"""
     if not ALERT_QUEUE:
         return
     batch, ALERT_QUEUE[:] = ALERT_QUEUE[:], []
-    for i in range(0, len(batch), 5):
-        await loop.run_in_executor(None, send_telegram, "\n\n".join(batch[i:i + 5]))
-        await asyncio.sleep(1)
+    for msg in batch:
+        await loop.run_in_executor(None, send_telegram, msg)
+        await asyncio.sleep(ALERT_SEND_GAP)
 
 
 # =========================
@@ -1426,26 +1437,43 @@ def _mkt_name(mkt: str) -> str:
     return "上市" if mkt == "tse" else "上櫃"
 
 
+INDUSTRY_MAX_LEN = 18                # 族群文字超過這個長度就截斷加「...」
+
+
+def _short(text: str, limit: int = INDUSTRY_MAX_LEN) -> str:
+    text = text or "未分類"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
+    """一則訊息只含一檔股票。"""
     names = {"A1": "A1 均線突破首日", "A2": "A2 強勢跳空", "A3": "A3 均線糾結突破"}
-    title = " + ".join(names[k] for k in sig["kind"].split("+"))
-    lines = [f"🚀 <b>【進場訊號 A+B+C】{sig['code']} {sig['name']}</b>", f"• 型態：<b>{title}</b>"]
-    if "A1" in sig["kind"]:
-        lines.append(f"• A1：昨收 {sig['yest_close']:.2f} < 昨日均線最高 {sig['prev_ma_max']:.2f}，現價同時站上 MA5/10/20")
-    if "A2" in sig["kind"]:
-        lines.append(f"• A2：開盤 {sig['open']:.2f} > 昨高 {sig['yest_high']:.2f} × {GAP_RATIO}（{sig['yest_high'] * GAP_RATIO:.2f}）")
-    if "A3" in sig["kind"] and sig.get("a3_spread") is not None:
-        lines.append(f"• A3：昨日 MA5/10/20 糾結幅度 {sig['a3_spread']:.2f}%（≤ {A3_SQUEEZE_PCT:g}%），現價突破均線群高點 {sig['a3_high']:.2f}")
-    ry = "無資料" if sig["ratio_yest"] is None else f"{sig['ratio_yest']:.2f} 倍"
+    kinds = sig["kind"].split("+")
+    pattern = " + ".join(names[k] for k in kinds)
+    t_now = now.strftime("%H:%M:%S")
+    lines = [
+        f"🚀 <b>【A+B+C 強勢突破】</b> <b>{sig['code']} {sig['name']}</b>",
+        "━━━━━━━━━━━━━━━",
+        f"📈 <b>現價：{sig['price']:.2f} ({sig['chg']:+.1f}%)</b>",
+        f"▫️ <b>開/昨收/昨高：</b>{sig['open']:.2f} / {sig['yest_close']:.2f} / {sig['yest_high']:.2f}",
+        f"▫️ <b>型態：</b>{pattern}",
+    ]
+    if "A3" in kinds and sig.get("a3_spread") is not None:
+        lines.append(f"▫️ <b>糾結：</b>昨日均線差 {sig['a3_spread']:.2f}% ➔ 突破 {sig['a3_high']:.2f}")
     lines += [
-        f"• 現價 <b>{sig['price']:.2f}</b>（{sig['chg']:+.1f}%）｜開盤 {sig['open']:.2f}｜昨收 {sig['yest_close']:.2f}｜昨高 {sig['yest_high']:.2f}",
-        f"• B 爆量：累積 {sig['vol']:,.0f} 張＝5 日同期均量 <b>{sig['ratio_avg']:.2f} 倍</b>（{sig['avg_now']:,.0f}）｜昨日同期 {ry}（{sig['yest_now']:,.0f}）",
-        f"• C 熱度：已成交 {sig['val'] / 1e8:.2f} 億｜預估全日 {sig['est_turnover'] / 1e8:.2f} 億（門檻 {MIN_EST_TURNOVER / 1e8:.0f} 億）",
-        f"• MA5/10/20：{sig['ma5']:.2f} / {sig['ma10']:.2f} / {sig['ma20']:.2f}",
-        f"• ✂️ MA5 減碼參考價：<b>{sig['ma5_cut']:.2f}</b>（前 4 日收盤均價；今日收盤跌破此價 = 收盤跌破 MA5）",
-        f"• 族群：{sig['industry'] or '未分類'}｜{_mkt_name(sig['market'])}",
-        f"• ✅ 二次確認：首次符合 {sig.get('first_time', '-')}（{sig.get('first_price', sig['price']):.2f}）→ 再次符合 {now.strftime('%H:%M:%S')}（{sig['price']:.2f}）",
-        f"• 今日第 {n_today} 則｜時間：{now.strftime('%H:%M:%S')}",
+        "",
+        "📊 <b>【量能與熱度】</b>",
+        f"▫️ <b>爆量倍數：</b>5日同期 <b>{sig['ratio_avg']:.2f}x</b> ({sig['vol']:,.0f}張)",
+        f"▫️ <b>成交金額：</b>已成交 {sig['val'] / 1e8:.2f}億 ｜ 預估全日 <b>{sig['est_turnover'] / 1e8:.2f}億</b>",
+        "",
+        "✂️ <b>【風控與防守】</b>",
+        f"▫️ <b>MA5 減碼價：</b><code>{sig['ma5_cut']:.2f}</code> (收盤跌破即破線)",
+        f"▫️ <b>均線序列：</b>{sig['ma5']:.2f} / {sig['ma10']:.2f} / {sig['ma20']:.2f} (5/10/20)",
+        "",
+        "🏷️ <b>【其他資訊】</b>",
+        f"▫️ <b>族群：</b>{_short(sig['industry'])}",
+        f"▫️ <b>確認：</b>{sig.get('first_time', '-')} ➔ {t_now}",
+        f"⏱️ <b>今日第 {n_today} 則 ｜ {t_now}</b>",
     ]
     return "\n".join(lines)
 
@@ -1723,7 +1751,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v54：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
+    print("飆股雷達 v55：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -1774,7 +1802,7 @@ async def main_async() -> None:
 
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v54】即時監控啟動（A+B+C＋二次確認）</b>",
+        "📡 <b>【飆股雷達 v55】即時監控啟動（A+B+C＋二次確認）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
         f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
