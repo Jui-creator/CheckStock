@@ -2,7 +2,7 @@ name: 強勢股池回算
 on:
   # 只手動執行：Actions 頁面點「Run workflow」。
   # 用官方 TWSE/TPEx 日資料逐日回算過去 15 個交易日的收盤確認（A+B+C，含 A4 延後量能確認），並套用「收盤跌破 MA10 / 突破日低點即移出」規則，
-  # 重建 signal_history.json（強勢股池）與 breakout_watch.json（突破觀察池），commit 回 repo。
+  # 重建 signal_history.json（強勢股池）與 breakout_watch.json（突破觀察池），commit 回 repo，並產生 strong_pool.csv 傳到 Telegram。
   # 使用時機：第一次啟用強勢股池或 A4、升級規則版本、或某天收盤確認失敗導致歷史缺漏時。本次升級（加入 A4）建議先跑一次。
   # 建議交易日 15:30 以後執行（官方當日資料約 15:00 後齊全），約 3～5 分鐘。不需要富邦登入。
   workflow_dispatch:
@@ -58,6 +58,14 @@ jobs:
             sleep 5
           done
           exit 1
+
+      - name: 上傳強勢股池明細 CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strong-pool
+          path: strong_pool.csv
+          if-no-files-found: ignore
 
       - name: 失敗通知
         if: failure() || cancelled()
