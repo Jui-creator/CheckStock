@@ -1,4 +1,4 @@
-"""飆股雷達 v59：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v60：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:05～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
   A（四擇一，滿足任一項即可）
@@ -36,6 +36,7 @@
   出場、停損、持倉追蹤都不做，由你自行判斷（第一階段收盤跌破 MA5 減碼一半、第二階段收盤跌破 MA10 清倉）。
 【強勢股池與標籤】（signal_history.json）
   收盤確認「通過」的股票加入強勢股池（最多保留 15 個交易日），之後每天記錄它們的收盤價、MA5、MA10。
+  每筆突破訊號同時記下「突破日成交額（億）」（signals[].turnover，單位 億元），strong_pool.csv 的「突破日成交額(億)」欄讀的就是它。
   ★ 移出（重置）規則：任何一天「收盤」跌破 MA10，或「收盤」跌破最近一次突破日的最低價，整檔立刻移出強勢股池
     ——池子永遠只留「現在還在發酵」的強勢股；移出後若再度通過 A+B+C，會被當成全新的「強勢突破」。
   盤中發訊號時依股池加上標籤：
@@ -1343,7 +1344,7 @@ def record_history_day(hist: dict, day: str, passed: list, closes: dict) -> list
     """寫入某一個交易日，回傳當天被移出的股票 [{code, name, reason, type}]。
     順序：① 先用當天收盤檢查既有強勢股，跌破就整筆移出 → ② 當天收盤確認通過的加入（含剛被移出又重新通過的，視為全新突破）
          → ③ 更新池中股票當天的 (收盤, MA5, MA10) → ④ 修剪過期。
-    passed = [{code, name, price, kind, low}]；closes = {代號: (收盤, MA5, MA10)}。"""
+    passed = [{code, name, price, kind, low, val}]（val = 當日成交金額，單位 元，存檔時換成億）；closes = {代號: (收盤, MA5, MA10)}。"""
     if day not in hist["days"]:
         hist["days"].append(day)
     resets = []
@@ -1358,7 +1359,8 @@ def record_history_day(hist: dict, day: str, passed: list, closes: dict) -> list
         rec["name"] = p["name"]
         rec["signals"] = [s for s in rec["signals"] if s["date"] != day]
         rec["signals"].append({"date": day, "price": round(p["price"], 2), "kind": p["kind"],
-                               "low": round(p["low"], 2) if p.get("low") else None})
+                               "low": round(p["low"], 2) if p.get("low") else None,
+                               "turnover": round(p["val"] / 1e8, 2) if p.get("val") else None})   # 突破日成交額（億）
         rec["signals"].sort(key=lambda s: s["date"])
     for code, rec in hist["stocks"].items():
         v = closes.get(code)
@@ -1503,6 +1505,7 @@ def record_watch_day(watch: dict, day: str, cands: list, passed_codes: set, clos
             "name": c["name"], "date": day, "price": round(c["price"], 2),
             "low": round(c["low"], 2) if c.get("low") else None, "kind": c.get("kind", ""),
             "b1": round(c.get("b1") or 0.0, 2),
+            "turnover": round(c["val"] / 1e8, 2) if c.get("val") else None,      # 突破日成交額（億）
         }
     return out
 
@@ -1599,10 +1602,10 @@ def backfill_history(days: int = HISTORY_DAYS) -> bool:
             if not r:
                 continue
             if r["passed"]:
-                passed.append({"code": code, "name": item["name"], "price": close, "kind": r["kind"], "low": r.get("low")})
+                passed.append({"code": code, "name": item["name"], "price": close, "kind": r["kind"], "low": r.get("low"), "val": item.get("value")})
             elif A4_ENABLED and r["a_new"] and r["c_ok"] and not r["b_ok"]:
                 cands.append({"code": code, "name": item["name"], "price": close, "low": item.get("low"),
-                              "kind": r["kind_new"], "b1": r["ratio_avg"]})
+                              "kind": r["kind_new"], "b1": r["ratio_avg"], "val": item.get("value")})
         resets = record_history_day(hist, d.isoformat(), passed, closes)
         last_resets, last_closes, last_wout = resets, closes, []
         all_resets += [dict(x, day=d.isoformat()) for x in resets]
@@ -2078,7 +2081,7 @@ def export_daily_report(day_str: str, signals: list, close_results: dict = None,
 POOL_FIELDS = [
     "區別", "代號", "名稱", "市場", "族群", "狀態",
     "首次入池/突破日", "最近突破日", "突破次數", "觀察/在池交易日數", "剩餘觀察日", "突破型態",
-    "最近突破價", "突破日低點", "突破日量能倍數(未達標)",
+    "最近突破價", "突破日成交額(億)", "突破日低點", "突破日量能倍數(未達標)",
     "今日收盤", "距突破價(%)", "MA5", "距MA5(%)", "MA10", "距MA10(%)", "距突破日低點(%)", "期間最大回檔(%)",
     "明日MA5減碼參考價", "移出/失效原因",
 ]
@@ -2131,7 +2134,7 @@ def build_pool_rows(hist: dict, watch: dict, resets: list, wout: list, closes: d
             "區別": "強勢股池", "代號": code, "名稱": rec.get("name", code), "市場": market, "族群": industry, "狀態": status,
             "首次入池/突破日": first["date"], "最近突破日": last["date"], "突破次數": len(sigs),
             "觀察/在池交易日數": len([d for d in hist["days"] if d >= first["date"]]), "剩餘觀察日": "",
-            "突破型態": last.get("kind", ""), "最近突破價": last.get("price", ""), "突破日低點": last.get("low") or "",
+            "突破型態": last.get("kind", ""), "最近突破價": last.get("price", ""), "突破日成交額(億)": last.get("turnover") or "", "突破日低點": last.get("low") or "",
             "突破日量能倍數(未達標)": "",
             "今日收盤": round(close, 2) if close else "", "距突破價(%)": _pct(close, last.get("price")),
             "MA5": round(ma5, 2) if ma5 else "", "距MA5(%)": _pct(close, ma5),
@@ -2152,7 +2155,7 @@ def build_pool_rows(hist: dict, watch: dict, resets: list, wout: list, closes: d
             "區別": "突破觀察池", "代號": code, "名稱": rec.get("name", code), "市場": market, "族群": industry, "狀態": "觀察中（等量能到位）",
             "首次入池/突破日": rec["date"], "最近突破日": rec["date"], "突破次數": 1,
             "觀察/在池交易日數": observed, "剩餘觀察日": max(WATCH_DAYS - observed, 0), "突破型態": rec.get("kind", ""),
-            "最近突破價": rec.get("price", ""), "突破日低點": rec.get("low") or "",
+            "最近突破價": rec.get("price", ""), "突破日成交額(億)": rec.get("turnover") or "", "突破日低點": rec.get("low") or "",
             "突破日量能倍數(未達標)": rec.get("b1", ""),
             "今日收盤": round(close, 2) if close else "", "距突破價(%)": _pct(close, rec.get("price")),
             "MA5": round(ma5, 2) if ma5 else "", "距MA5(%)": _pct(close, ma5),
@@ -2408,7 +2411,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
                 closes[code] = (price, ma5, ma10)
         resets = record_history_day(
             hist, today_str,
-            [{"code": r["code"], "name": r["name"], "price": r["price"], "kind": r["kind"], "low": r.get("low")} for r in passed],
+            [{"code": r["code"], "name": r["name"], "price": r["price"], "kind": r["kind"], "low": r.get("low"), "val": r.get("val")} for r in passed],
             closes)
         save_history(hist)
         pool_note = f"♻️ 強勢股池：今日移出 {len(resets)} 檔，目前剩 {len(hist['stocks'])} 檔（現正發酵）"
@@ -2436,7 +2439,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
             wout = record_watch_day(
                 watch, today_str,
                 [{"code": r["code"], "name": r["name"], "price": r["price"], "low": r.get("low"),
-                  "kind": r["kind_new"], "b1": r["ratio_avg"]} for r in watch_cands],
+                  "kind": r["kind_new"], "b1": r["ratio_avg"], "val": r.get("val")} for r in watch_cands],
                 {r["code"] for r in passed}, wcloses)
             save_watch(watch)
             cnt = {k: sum(1 for x in wout if x["type"] == k) for k in ("promoted", "ma10", "low", "expired")}
@@ -2499,7 +2502,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v59：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
+    print("飆股雷達 v60：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -2554,7 +2557,7 @@ async def main_async() -> None:
 
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v59】即時監控啟動（A+B+C＋二次確認）</b>",
+        "📡 <b>【飆股雷達 v60】即時監控啟動（A+B+C＋二次確認）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
         f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
