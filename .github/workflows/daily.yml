@@ -95,14 +95,15 @@ jobs:
             sleep 5
           done || true
 
+      # daily_report.csv：每日整合報告（盤中通知 + 收盤確認）；strong_pool.csv：強勢股池 / 突破觀察池 / 今日移出明細（兩份也會傳到 Telegram）
       - name: 上傳 CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: radar-report
           path: |
-            signals_today.csv
-            close_confirm.csv
+            daily_report.csv
+            strong_pool.csv
             signal_history.json
             breakout_watch.json
           if-no-files-found: ignore
