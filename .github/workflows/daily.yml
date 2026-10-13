@@ -76,14 +76,15 @@ jobs:
       # 要 commit 的檔案：
       #   stock_states.json    當天已觸發名單（程式中斷重跑時不會重複通知）
       #   volume_baseline.json 雷達開盤時若發現基準檔過期而自動補算，新檔也要存回 repo
-      #   signal_history.json  強勢歷史（收盤確認後更新，明天判斷「初次 / 拉回再發動 / 連續強勢」用）
+      #   signal_history.json  強勢股池（收盤確認後更新：新通過的加入、收盤跌破 MA10 / 突破日低點的移出）
+      #   breakout_watch.json  突破觀察池（A4 用：價格先突破、量能未達標的股票；收盤確認後更新，最多觀察 5 個交易日）
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in stock_states.json volume_baseline.json signal_history.json; do
+          for f in stock_states.json volume_baseline.json signal_history.json breakout_watch.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
@@ -103,6 +104,7 @@ jobs:
             signals_today.csv
             close_confirm.csv
             signal_history.json
+            breakout_watch.json
           if-no-files-found: ignore
 
       # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
