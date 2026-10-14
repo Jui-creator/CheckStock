@@ -1,4 +1,4 @@
-"""飆股雷達 v60：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v61：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:05～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
   A（四擇一，滿足任一項即可）
@@ -31,8 +31,11 @@
      下一輪（約 15～30 秒後）必須再次同時符合才發通知；下一輪沒再符合就移出觀察池，過濾點火後撤單的假突破。
 【通知】
   盤中：二次確認通過立即通知（一則訊息只含一檔股票，逐則送出、間隔 1 秒），並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
-  收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，回報「今日共有 X 檔符合」、大盤 MA20 狀態，
-        並列出「盤中觸發但收盤未通過」的股票與原因；同時輸出 daily_report.csv（盤中通知 + 收盤確認整合）與 strong_pool.csv（強勢股池明細），並傳到 Telegram。
+  收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，Telegram 分 3 則獨立訊息（依類別分流，各有圖示標題），再傳 2 份 CSV：
+        ① 📊 大盤與強勢股異動：大盤 MA20 格局、強勢股池檔數、今日被移出的股票（跌破 MA10 / 突破日低點）。
+        ② ✅ 收盤確認通過：核心進場標的，每檔 3 行（代號型態收盤漲幅 / 量額與 MA5 減碼價 / 族群），依成交額大到小。
+        ③ 👀 觀察與未過濾清單：突破觀察池（價格先突破、量能未達標；A4 的候選股），不列「盤中觸發但收盤未過」的股票。
+        CSV：daily_report.csv（盤中通知 + 收盤確認整合，含盤中觸發但收盤未過的明細）、strong_pool.csv（強勢股池明細）。
   出場、停損、持倉追蹤都不做，由你自行判斷（第一階段收盤跌破 MA5 減碼一半、第二階段收盤跌破 MA10 清倉）。
 【強勢股池與標籤】（signal_history.json）
   收盤確認「通過」的股票加入強勢股池（最多保留 15 個交易日），之後每天記錄它們的收盤價、MA5、MA10。
@@ -1326,17 +1329,17 @@ def prune_history(hist: dict) -> None:
 
 def reset_reason(rec: dict, day: str, v):
     """某一天收盤後，這檔強勢股要不要移出池。v = (收盤, MA5, MA10)（MA 含當天收盤）。
-    只看「當天以前」的突破訊號；回傳 (原因文字, 類型) 或 None。"""
+    只看「當天以前」的突破訊號；回傳 (原因文字, 類型, 收盤價, 門檻價) 或 None。"""
     sigs = [s for s in rec.get("signals", []) if s["date"] < day]
     if not sigs or v is None:
         return None
     close, _ma5, ma10 = v
     if RESET_ON_MA10_BREAK and ma10 and close < ma10:
-        return f"收盤 {close:.2f} 跌破 MA10（{ma10:.2f}）", "ma10"
+        return f"收盤 {close:.2f} 跌破 MA10（{ma10:.2f}）", "ma10", close, ma10
     ref = sigs[-1] if RESET_LOW_BASIS == "latest" else sigs[0]
     low = ref.get("low")
     if RESET_ON_LOW_BREAK and low and close < low:
-        return f"收盤 {close:.2f} 跌破 {_mmdd(ref['date'])} 突破日低點（{low:.2f}）", "low"
+        return f"收盤 {close:.2f} 跌破 {_mmdd(ref['date'])} 突破日低點（{low:.2f}）", "low", close, low
     return None
 
 
@@ -1352,7 +1355,8 @@ def record_history_day(hist: dict, day: str, passed: list, closes: dict) -> list
         rec = hist["stocks"][code]
         res = reset_reason(rec, day, closes.get(code))
         if res:
-            resets.append({"code": code, "name": rec.get("name", code), "reason": res[0], "type": res[1]})
+            resets.append({"code": code, "name": rec.get("name", code), "reason": res[0], "type": res[1],
+                           "close": res[2], "level": res[3]})
             del hist["stocks"][code]
     for p in passed:
         rec = hist["stocks"].setdefault(p["code"], {"name": p["name"], "signals": [], "track": {}})
@@ -2192,33 +2196,107 @@ def export_pool_csv(day_str: str, rows: list) -> pathlib.Path:
     return POOL_CSV_FILE
 
 
-def build_close_message(day_str: str, passed: list, failed: list, n_signals: int, market_txt: str, note: str) -> str:
-    fresh = sum(1 for r in passed if not r["notified"])
-    lines = [f"📴 <b>【飆股雷達】收盤確認 {day_str}</b>",
-             f"今日共有 <b>{len(passed)} 檔</b>股票符合 A+B+C 進場策略（收盤確認）｜盤中共發出 {n_signals} 則訊號"
-             + (f"｜其中 🆕 {fresh} 檔盤中沒通知過、收盤才符合" if fresh else ""),
-             market_txt]
-    if note:
-        lines.append(note)
-    if passed:
-        lines += ["", f"✅ <b>收盤確認通過 {len(passed)} 檔</b>"]
-        for r in passed:
-            tag = f"盤中 {r['notified']} 已通知" if r["notified"] else "🆕 收盤才符合"
-            lines.append(
-                f"• {TAG_TITLE.get((r.get('hist') or {}).get('kind', 'first'))[0]} {r['code']} {r['name']}｜{r['kind']}｜收 {r['price']:.2f}（{r['chg']:+.1f}%）"
-                f"｜量 {r['ratio_avg']:.2f}x（昨日 {r['ratio_yest']:.2f}x）｜額 {r['val'] / 1e8:.1f} 億"
-                f"｜明日 MA5 減碼參考 {r['next_ma5_cut']:.2f}｜{tag}｜{r['industry'] or '未分類'}")
+def _parse_chains(text: str) -> list:
+    """把族群文字（"大類>子類、大類>子類"，子類本身也可能含「、」）拆回 [[大類, 子類], ...]。"""
+    chains = []
+    for piece in str(text or "").split("、"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if ">" in piece:
+            top, sub = piece.split(">", 1)
+            chains.append([top.strip(), sub.strip()])
+        elif chains:
+            chains[-1][1] += "、" + piece           # 沒有「>」的片段屬於上一個子類名稱
+        else:
+            chains.append([piece, ""])
+    return chains
+
+
+def industry_compact(text: str, limit: int = 24) -> str:
+    """族群縮短成一行：只有一條產業鏈 → 「大類 > 子類」；同一大類多條 → 只顯示大類；不同大類 → 「大類 / 大類」。"""
+    chains = _parse_chains(text)
+    if not chains:
+        return "未分類"
+    tops = list(dict.fromkeys(c[0] for c in chains))
+    if len(tops) == 1:
+        label = f"{tops[0]} > {chains[0][1]}" if (len(chains) == 1 and chains[0][1]) else tops[0]
     else:
-        lines += ["", "✅ 今日沒有股票通過收盤確認。"]
-    if failed:
-        lines += ["", f"⚠️ <b>盤中觸發但收盤未通過 {len(failed)} 檔</b>"]
-        for r in failed:
-            lines.append(f"• {r['code']} {r['name']}｜盤中 {r['notified']} 通知｜{'；'.join(r['reasons'])}")
+        label = " / ".join(tops[:2])
+    return label if len(label) <= limit else label[:limit] + "..."
+
+
+def _reset_line(x: dict) -> str:
+    if x.get("close") is not None and x.get("level") is not None:
+        what = f"跌破 MA10 ({x['level']:.2f})" if x.get("type") == "ma10" else f"跌破突破日低點 ({x['level']:.2f})"
+        return f"🔻 {x['code']} {x['name']}｜收 {x['close']:.2f} {what}"
+    return f"🔻 {x['code']} {x['name']}｜{x.get('reason', '')}"
+
+
+RESET_LIST_MAX = 15                  # 訊息 1 最多列出幾檔被移出的股票
+WATCH_LIST_MAX = 20                  # 訊息 3 最多列出幾檔觀察中的股票
+PASS_MSG_LIMIT = 3500                # 訊息 2 單則字數上限（Telegram 上限 4096，留餘裕）
+
+
+def build_market_message(day_str: str, market_line: str, hist, resets: list, warnings: list) -> str:
+    """訊息 1：📊 大盤與強勢股異動。hist = None 代表強勢股池寫入失敗。"""
+    lines = [f"📊 <b>【飆股雷達】大盤與強勢股動態｜{day_str}</b>", market_line]
+    if hist is not None:
+        lines.append(f"強勢股池：目前共 {len(hist['stocks'])} 檔（今日移出 {len(resets)} 檔）")
+        lines += [_reset_line(x) for x in resets[:RESET_LIST_MAX]]
+        if len(resets) > RESET_LIST_MAX:
+            lines.append(f"…另有 {len(resets) - RESET_LIST_MAX} 檔（完整名單見 strong_pool.csv）")
+    else:
+        lines.append("強勢股池：本日寫入失敗，名單未更新")
+    if warnings:
+        lines += [""] + warnings
     return "\n".join(lines)
 
 
-def market_status_text(feed, today: date_cls) -> str:
-    """大盤 MA20 狀態（只顯示，不當濾網）。用官方歷史收盤 + 富邦今日加權指數。"""
+def _pass_block(r: dict) -> str:
+    return (f"<b>{r['code']} {r['name']}</b>｜{r['kind']}｜收 {r['price']:.2f} ({r['chg']:+.1f}%)\n"
+            f"📈 量 {r['ratio_avg']:.2f}x ｜額 {r['val'] / 1e8:.1f}億 ｜MA5 減碼 {r['next_ma5_cut']:.2f}\n"
+            f"🏷️ {industry_compact(r.get('industry'))}")
+
+
+def build_pass_messages(passed: list, limit: int = PASS_MSG_LIMIT) -> list:
+    """訊息 2：✅ 收盤確認通過（核心進場標的）。檔數多、超過字數上限時自動拆成多則（後面的標題加「續」）。"""
+    header = f"✅ <b>【飆股雷達】收盤確認通過 ({len(passed)} 檔)</b>"
+    if not passed:
+        return [header + "\n今日沒有股票通過收盤確認。"]
+    msgs, cur = [], header
+    for r in passed:
+        block = _pass_block(r)
+        if len(cur) + 2 + len(block) > limit and cur not in (header, ""):
+            msgs.append(cur)
+            cur = "✅ <b>【飆股雷達】收盤確認通過（續）</b>"
+        cur += "\n\n" + block
+    msgs.append(cur)
+    return msgs
+
+
+def build_watch_message(items: list, stats: dict) -> str:
+    """訊息 3：👀 觀察與未過濾清單。items = [{code, name, chg, ratio, b_ok, days}]（已依成交額排序）。
+    只列突破觀察池；「盤中觸發但收盤未過」的股票不列（明細在 daily_report.csv）。"""
+    lines = ["👀 <b>【飆股雷達】觀察與未過濾清單</b>", f"👁️ 突破觀察中 ({len(items)} 檔)"]
+    if not items:
+        lines.append("目前沒有（價格先突破、量能未達標的股票，會在收盤後加入）")
+    for it in items[:WATCH_LIST_MAX]:
+        chg = "—" if it.get("chg") is None else f"{it['chg']:+.1f}%"
+        ratio = "—" if it.get("ratio") is None else f"{it['ratio']:.2f}x"
+        status = "量已達標" if it.get("b_ok") else "未達標"
+        day = f"｜突破後第{it['days']}天" if it.get("days") else ""
+        lines.append(f"{it['code']} {it['name']} ({chg})｜同期量 {ratio} ({status}){day}")
+    if len(items) > WATCH_LIST_MAX:
+        lines.append(f"…另有 {len(items) - WATCH_LIST_MAX} 檔（完整名單見 strong_pool.csv）")
+    if stats:
+        lines.append(f"📌 今日新增 {stats['added']}｜轉入強勢股池 {stats['promoted']}｜失效 {stats['broken']}｜到期 {stats['expired']}")
+    return "\n".join(lines)
+
+
+def market_status_info(feed, today: date_cls) -> dict:
+    """大盤 MA20 狀態（只顯示，不當濾網）。用官方歷史收盤 + 富邦今日加權指數。
+    回傳 {"ok": 是否取得, "close": 指數, "ma20": MA20, "above": 是否在 MA20 之上}。"""
     try:
         closes = fetch_taiex_closes(today)
         hist = [v for d, v in closes if d < today]
@@ -2230,12 +2308,28 @@ def market_status_text(feed, today: date_cls) -> str:
             print(f"[大盤] 富邦指數 {live} 與官方昨收 {hist[-1]} 差距過大，不採用", flush=True)
         if len(hist) >= 19 and today_close:
             ma20 = (sum(hist[-19:]) + today_close) / 20
-            if today_close > ma20:
-                return f"大盤：加權指數 {today_close:,.0f}，位於 MA20（{ma20:,.0f}）之上，多頭格局 ✅"
-            return f"大盤：加權指數 {today_close:,.0f}，低於 MA20（{ma20:,.0f}），非多頭格局 ⚠️"
+            return {"ok": True, "close": today_close, "ma20": ma20, "above": today_close > ma20}
     except Exception as exc:
         print(f"[大盤] 狀態計算失敗：{type(exc).__name__}: {exc}", flush=True)
-    return "大盤：狀態無法取得（加權指數或官方資料抓取失敗）"
+    return {"ok": False}
+
+
+def market_status_text(feed, today: date_cls) -> str:
+    info = market_status_info(feed, today)
+    if not info["ok"]:
+        return "大盤：狀態無法取得（加權指數或官方資料抓取失敗）"
+    if info["above"]:
+        return f"大盤：加權指數 {info['close']:,.0f}，位於 MA20（{info['ma20']:,.0f}）之上，多頭格局 ✅"
+    return f"大盤：加權指數 {info['close']:,.0f}，低於 MA20（{info['ma20']:,.0f}），非多頭格局 ⚠️"
+
+
+def market_line(info: dict) -> str:
+    """訊息 1 的大盤一行。"""
+    if not info.get("ok"):
+        return "大盤格局：狀態無法取得（加權指數或官方資料抓取失敗）"
+    if info["above"]:
+        return f"大盤格局：加權指數 {info['close']:,.0f}｜位於 MA20（{info['ma20']:,.0f}）之上 多頭 ✅"
+    return f"大盤格局：加權指數 {info['close']:,.0f}｜低於 MA20（{info['ma20']:,.0f}）非多頭 ⚠️"
 
 
 # =========================
@@ -2374,7 +2468,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
         print(f"[收盤確認] 快照日期 {dates} 不是今天 {today_str}，視為非交易日，不發收盤報告", flush=True)
         return False
 
-    passed, failed, watch_cands = [], [], []
+    passed, failed, watch_cands, results = [], [], [], {}
     for code, base in bases.items():
         if not base["liquid"] or base["market"] in UNRELIABLE_MARKETS:
             continue
@@ -2386,6 +2480,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
             continue
         r["notified"] = (STATE["triggered"].get(code) or {}).get("time", "")
         r["hist"] = effective_tag(base.get("hist"), r["kind"])
+        results[code] = r                                   # 全部結果（觀察池要用今日漲幅與量能倍數）
         if r["passed"]:
             passed.append(r)
         else:
@@ -2398,7 +2493,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
     failed.sort(key=lambda r: r["notified"])
 
     # 強勢股池：先移出今天收盤跌破 MA10 / 突破日低點的，再把今天通過的加進去
-    hist_note, pool_note = "", ""
+    hist_note = ""
     hist, resets, watch, wout, closes = None, [], None, [], {}
     try:
         hist = load_history()
@@ -2414,18 +2509,13 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
             [{"code": r["code"], "name": r["name"], "price": r["price"], "kind": r["kind"], "low": r.get("low"), "val": r.get("val")} for r in passed],
             closes)
         save_history(hist)
-        pool_note = f"♻️ 強勢股池：今日移出 {len(resets)} 檔，目前剩 {len(hist['stocks'])} 檔（現正發酵）"
-        if resets:
-            pool_note += "\n" + "\n".join(f"• {x['code']} {x['name']}｜{x['reason']}" for x in resets[:15])
-            if len(resets) > 15:
-                pool_note += f"\n…另有 {len(resets) - 15} 檔"
         print(f"[強勢股池] 已寫入 {today_str}：通過 {len(passed)} 檔、移出 {len(resets)} 檔，池中共 {len(hist['stocks'])} 檔、{len(hist['days'])} 個交易日", flush=True)
     except Exception as exc:
         hist_note = f"⚠️ 強勢股池寫入失敗（{type(exc).__name__}: {exc}），明天的標籤可能不準，可手動執行 history_backfill 補回"
         print(hist_note, flush=True)
 
     # 突破觀察池：今天通過的轉入強勢股池、跌破 MA10 / 原低點的失效、到期的移出，再加入今天新的候選
-    watch_note = ""
+    watch_stats, watch_err = None, ""
     if A4_ENABLED:
         try:
             watch = load_watch()
@@ -2443,34 +2533,48 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
                 {r["code"] for r in passed}, wcloses)
             save_watch(watch)
             cnt = {k: sum(1 for x in wout if x["type"] == k) for k in ("promoted", "ma10", "low", "expired")}
-            watch_note = (f"👀 突破觀察池：新增 {len(watch_cands)} 檔（價格先突破、量能未達標）｜轉入強勢股池 {cnt['promoted']}｜"
-                          f"跌破失效 {cnt['ma10'] + cnt['low']}｜到期 {cnt['expired']}｜目前觀察中 {len(watch['stocks'])} 檔")
-            if watch_cands:
-                watch_note += "\n" + "\n".join(
-                    f"• {r['code']} {r['name']}｜{r['kind_new']}｜收 {r['price']:.2f}（{r['chg']:+.1f}%）｜同期量 {r['ratio_avg']:.2f}x 未達標"
-                    for r in sorted(watch_cands, key=lambda r: -r["val"])[:12])
-                if len(watch_cands) > 12:
-                    watch_note += f"\n…另有 {len(watch_cands) - 12} 檔"
+            watch_stats = {"added": len(watch_cands), "promoted": cnt["promoted"],
+                           "broken": cnt["ma10"] + cnt["low"], "expired": cnt["expired"]}
             print(f"[突破觀察池] 已寫入 {today_str}：新增 {len(watch_cands)} 檔、轉入 {cnt['promoted']}、失效 {cnt['ma10'] + cnt['low']}、到期 {cnt['expired']}，觀察中 {len(watch['stocks'])} 檔", flush=True)
         except Exception as exc:
-            watch_note = f"⚠️ 突破觀察池寫入失敗（{type(exc).__name__}: {exc}），A4 明天可能少抓，可手動執行 history_backfill 補回"
-            print(watch_note, flush=True)
+            watch_err = f"⚠️ 突破觀察池寫入失敗（{type(exc).__name__}: {exc}），A4 明天可能少抓，可手動執行 history_backfill 補回"
+            print(watch_err, flush=True)
 
-    market_txt = await loop.run_in_executor(None, market_status_text, feed, today)
-    notes = []
+    # ---- Telegram 收盤訊息：依類別分成 3 則獨立訊息 ----
+    market_info = await loop.run_in_executor(None, market_status_info, feed, today)
+    warnings = []
     if UNRELIABLE_MARKETS:
-        notes.append(f"⚠️ {'、'.join('上市' if m == 'tse' else '上櫃' for m in sorted(UNRELIABLE_MARKETS))}歷史資料不完整，這些股票未納入")
+        warnings.append(f"⚠️ {'、'.join('上市' if m == 'tse' else '上櫃' for m in sorted(UNRELIABLE_MARKETS))}歷史資料不完整，這些股票未納入")
     if not baselines:
-        notes.append("⚠️ 今日沒有同期量基準，收盤確認的 B 條件改用官方成交量")
-    if pool_note:
-        notes.append(pool_note)
-    if watch_note:
-        notes.append(watch_note)
+        warnings.append("⚠️ 今日沒有同期量基準，收盤確認的 B 條件改用官方成交量")
     if hist_note:
-        notes.append(hist_note)
+        warnings.append(hist_note)
+    if watch_err:
+        warnings.append(watch_err)
+    msg1 = build_market_message(today_str, market_line(market_info), hist, resets, warnings)
+    msgs2 = build_pass_messages(passed)
+    msg3 = None
+    if A4_ENABLED:
+        items = []
+        if watch is not None:
+            for code, rec in watch["stocks"].items():
+                r = results.get(code)
+                items.append({
+                    "code": code, "name": rec.get("name", code),
+                    "chg": r["chg"] if r else None, "ratio": r["ratio_avg"] if r else rec.get("b1"),
+                    "b_ok": bool(r and r["b_ok"]),
+                    "days": len([d for d in watch["days"] if d > rec["date"]]),
+                    "_val": r["val"] if r else (rec.get("turnover") or 0) * 1e8,
+                })
+            items.sort(key=lambda it: -it["_val"])
+        msg3 = build_watch_message(items, watch_stats)
+    for i, message in enumerate([msg1] + msgs2 + ([msg3] if msg3 else [])):
+        if i:
+            await asyncio.sleep(1.0)                       # Telegram 同一聊天室每秒限 1 則
+        await loop.run_in_executor(None, send_telegram, message)
     n_signals = len(STATE["signals"])
-    message = build_close_message(today_str, passed, failed, n_signals, market_txt, "\n".join(notes))
-    await loop.run_in_executor(None, send_telegram, message)
+    print(f"[收盤確認] 已送出收盤訊息：大盤與強勢股 1 則、通過 {len(passed)} 檔（{len(msgs2)} 則）"
+          f"{'、觀察清單 1 則' if msg3 else ''}｜盤中共 {n_signals} 則訊號", flush=True)
 
     # 每日整合報告（盤中通知 + 收盤確認，每檔一列）
     # 只放「收盤通過」或「盤中通知過」的股票（passed + failed）；觀察池候選另見 strong_pool.csv
@@ -2502,7 +2606,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v60：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
+    print("飆股雷達 v61：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -2557,7 +2661,7 @@ async def main_async() -> None:
 
     liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
     startup = [
-        "📡 <b>【飆股雷達 v60】即時監控啟動（A+B+C＋二次確認）</b>",
+        "📡 <b>【飆股雷達 v61】即時監控啟動（A+B+C＋二次確認）</b>",
         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
         f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
         bl_text,
