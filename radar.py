@@ -1,4 +1,4 @@
-"""飆股雷達 v61：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v62：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:05～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
   A（四擇一，滿足任一項即可）
@@ -30,7 +30,8 @@
   ② 二次確認（Double-Confirmation）：某檔在某一輪首次符合 A+B+C，先放進「待確認觀察池」，
      下一輪（約 15～30 秒後）必須再次同時符合才發通知；下一輪沒再符合就移出觀察池，過濾點火後撤單的假突破。
 【通知】
-  盤中：二次確認通過立即通知（一則訊息只含一檔股票，逐則送出、間隔 1 秒），並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
+  開盤前（08:xx 啟動）：發一則「即時監控啟動」訊息，依區塊（行情與歷史基底 / 均量與同期量基準 / 強勢股池 / 突破觀察池 / 規則）分段顯示。
+  盤中：二次確認通過立即通知（一則訊息只含一檔股票，逐則送出、間隔 1 秒；標題直接寫標籤，例如「🛡️ 【拉回再發動】 1815 富喬」），並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
   收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，Telegram 分 3 則獨立訊息（依類別分流，各有圖示標題），再傳 2 份 CSV：
         ① 📊 大盤與強勢股異動：大盤 MA20 格局、強勢股池檔數、今日被移出的股票（跌破 MA10 / 突破日低點）。
         ② ✅ 收盤確認通過：核心進場標的，每檔 3 行（代號型態收盤漲幅 / 量額與 MA5 減碼價 / 族群），依成交額大到小。
@@ -90,6 +91,7 @@ IC_CACHE_FILE = BASE_DIR / "ic_sector_cache.json"
 REPORT_CSV_FILE = BASE_DIR / "daily_report.csv"
 POOL_CSV_FILE = BASE_DIR / "strong_pool.csv"
 BASELINE_RULE = "v50"               # baseline.py 與 radar.py 必須一致
+RADAR_VERSION = "v62"               # 顯示在啟動訊息與 log；改版時只要改這一行
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -1032,7 +1034,7 @@ def load_baseline(stock_bases: dict):
         if len(item.get("avg", [])) == len(MARKS) and len(item.get("yest", [])) == len(MARKS):
             out[code] = {"avg": item["avg"], "yest": item["yest"]}
     liquid = sum(1 for b in stock_bases.values() if b["liquid"])
-    return out, f"同期量基準：基準日 {ref}，涵蓋 {len(out)}/{liquid} 檔（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張）"
+    return out, f"同期量基準：基準日 {ref}，涵蓋 {len(out)}/{liquid} 檔"
 
 
 # =========================
@@ -1409,8 +1411,9 @@ def apply_history(bases: dict, hist: dict, today: str) -> str:
     days = [d for d in hist["days"] if d < today]
     if not days:
         return "強勢股池：尚無紀錄（請先手動執行 history_backfill 回算），本日全部標為「強勢突破」"
-    return (f"強勢股池：{n['pullback'] + n['streak']} 檔現正發酵（🔥連續強勢 {n['streak']}、🛡️拉回 {n['pullback']}）｜"
-            f"規則：收盤跌破 MA10 或突破日低點即移出｜紀錄區間 {days[0]}～{days[-1]}")
+    return (f"強勢股池：{n['pullback'] + n['streak']} 檔（🔥連續強勢 {n['streak']}、🛡️拉回 {n['pullback']}）\n"
+            f"規則：收盤跌破 MA10 或突破日低點即移出\n"
+            f"紀錄區間 {days[0]}～{days[-1]}")
 
 
 TAG_TITLE = {"first": ("🚀", "強勢突破"), "pullback": ("🛡️", "拉回再發動"), "streak": ("🔥", "連續強勢"),
@@ -1516,19 +1519,22 @@ def record_watch_day(watch: dict, day: str, cands: list, passed_codes: set, clos
 
 def apply_watch(bases: dict, watch: dict, today: str) -> str:
     """盤前：把觀察期內的股票掛在 base["watch"]（盤中 A4 直接讀）。回傳摘要文字。"""
-    n = 0
+    names = []
     for code, base in bases.items():
         w = watch_entry_for(watch, code, today)
         if w:
             base["watch"] = w
-            n += 1 if base.get("liquid") else 0
+            if base.get("liquid"):
+                names.append(f"{code} {base.get('name', code)}")
         else:
             base.pop("watch", None)
     if not A4_ENABLED:
         return "突破觀察池：A4 已關閉"
-    if not n:
+    if not names:
         return f"突破觀察池：目前沒有（價格先突破、量能未達標的股票，會在收盤後加入，觀察 {WATCH_DAYS} 個交易日）"
-    return f"突破觀察池：{n} 檔（{WATCH_DAYS} 個交易日內量能達標且守住均線，會以 ⏳A4 延後量能確認通知）"
+    shown = "、".join(names[:12]) + ("…" if len(names) > 12 else "")
+    return (f"突破觀察池：{len(names)} 檔（{WATCH_DAYS} 個交易日內量能達標且守住均線，會以 ⏳【延後量能確認】通知）\n"
+            f"{shown}")
 
 
 def backfill_history(days: int = HISTORY_DAYS) -> bool:
@@ -1864,7 +1870,7 @@ def check_close(base: dict, bl, row: dict):
     if not c3:
         reasons.append(f"C：收盤 {price:.2f} 未高於開盤 {open_:.2f}")
     if not c4:
-        reasons.append(f"C：收盤漲幅 {'無資料' if chg is None else f'{chg:+.1f}%'} 不在 +{CHG_MIN:.0f}%～+{CHG_MAX:.0f}%")
+        reasons.append(f"C：收盤漲幅 {'無資料' if chg is None else f'{chg:+.1f}%'} 不在 +{CHG_MIN:g}%～+{CHG_MAX:g}%")
     return {
         "code": base["code"], "name": base["name"], "market": base["market"], "industry": base["industry"],
         "kind": _kind(a1, a2, a3, a4) if a_ok else "", "kind_new": _kind(a1, a2, a3),
@@ -1903,8 +1909,8 @@ def _support_text(sig: dict) -> str:
 
 
 def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
-    """一則訊息只含一檔股票；標題依強勢股池加上「強勢突破 / 連續強勢 / 拉回再發動」標籤，
-    只靠 A4 觸發（且不在強勢股池）時顯示「⏳ 延後量能確認」。"""
+    """一則訊息只含一檔股票；標題只寫標籤（有訊號就代表 A+B+C 已符合，不再重複寫）：
+    🚀 強勢突破 / 🔥 連續強勢 / 🛡️ 拉回再發動；只靠 A4 觸發（且不在強勢股池）時顯示「⏳ 延後量能確認」。"""
     names = {"A1": "A1 均線突破首日", "A2": "A2 強勢跳空", "A3": "A3 均線糾結突破", "A4": "A4 延後量能確認"}
     kinds = sig["kind"].split("+")
     pattern = " + ".join(names[k] for k in kinds)
@@ -1913,7 +1919,7 @@ def build_signal_message(sig: dict, n_today: int, now: datetime) -> str:
     a4 = sig.get("a4") if "A4" in kinds else None
     in_pool = tag["kind"] in ("pullback", "streak")
     icon, label = TAG_TITLE.get(tag["kind"], TAG_TITLE["first"])
-    lines = [f"{icon} <b>【進場訊號 A+B+C｜{label}】</b> <b>{sig['code']} {sig['name']}</b>"]
+    lines = [f"{icon} <b>【{label}】</b> <b>{sig['code']} {sig['name']}</b>"]
     if in_pool:
         lines.append(f"💡 <b>上次突破：</b>{_mmdd(tag['last_date'])}（距今 {tag['days_ago']} 個交易日）@ {tag['last_price']:.2f}")
     elif a4:
@@ -2294,6 +2300,41 @@ def build_watch_message(items: list, stats: dict) -> str:
     return "\n".join(lines)
 
 
+def build_startup_message(stock_bases: dict, bases_from_cache: bool, bl_text: str, hist_text: str,
+                          watch_text: str, notes: list = None) -> str:
+    """開盤前啟動訊息。依區塊分段（空行隔開）：行情與歷史基底 / 均量與同期量基準 / 強勢股池 / 突破觀察池 / A 條件 / B、C 與時段。
+    notes = 最後附在底部的提醒（續跑、資料警告等）。"""
+    asof = max(b["asof_date"] for b in stock_bases.values())
+    liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
+    src_note = "" if bases_from_cache else "（官方資料即時預載，夜間快取不可用）"
+    a_lines = [
+        f"A（{'四' if A4_ENABLED else '三'}擇一）：",
+        "    A1 均線突破首日",
+        f"    A2 開盤 > 昨高 ×{GAP_RATIO:g}",
+        f"    A3 均線糾結（MA5/10/20 差距 ≤ {A3_SQUEEZE_PCT:g}%）後突破群高點",
+    ]
+    if A4_ENABLED:
+        a_lines.append("    A4 延後量能確認（觀察池內量能補到位）")
+    sections = [
+        [f"📡 <b>【飆股雷達 {RADAR_VERSION}】即時監控啟動（A+B+C＋二次確認）</b>",
+         f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）",
+         "歷史：TWSE/TPEx 官方",
+         f"歷史基底：基準日 {asof}，{len(stock_bases):,} 檔{src_note}"],
+        [f"5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n:,} 檔", bl_text],
+        [hist_text],
+        [watch_text],
+        a_lines,
+        [f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE:g} 且 ≥ 昨日同期量" if VS_YEST_RATIO == 1.0
+         else f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE:g} 且 ≥ 昨日同期量 ×{VS_YEST_RATIO:g}",
+         f"C：預估成交額 > {MIN_EST_TURNOVER / 1e8:.0f} 億、現價 > 開盤、漲幅 +{CHG_MIN:g}%～+{CHG_MAX:g}%",
+         f"判斷時段 09:{EVAL_START_MINUTE:02d}～13:30（避開集合競價）",
+         "二次確認：連續兩輪掃描都符合才通知｜同一檔當天只通知一次｜13:35 收盤確認"],
+    ]
+    if notes:
+        sections.append(list(notes))
+    return "\n\n".join("\n".join(s) for s in sections)
+
+
 def market_status_info(feed, today: date_cls) -> dict:
     """大盤 MA20 狀態（只顯示，不當濾網）。用官方歷史收盤 + 富邦今日加權指數。
     回傳 {"ok": 是否取得, "close": 指數, "ma20": MA20, "above": 是否在 MA20 之上}。"""
@@ -2606,7 +2647,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print("飆股雷達 v61：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
+    print(f"飆股雷達 {RADAR_VERSION}：1～2 週短線波段 A+B+C＋二次確認（富邦 Neo API）", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -2630,6 +2671,7 @@ async def main_async() -> None:
 
     # 歷史基底：優先讀夜間快取（幾秒內完成，09:00 就能開始判斷）；不可用才即時向官方預載（約 2～3 分鐘）
     stock_bases, bases_source = await loop.run_in_executor(None, load_bases_cache, feed, today)
+    bases_from_cache = bool(stock_bases)
     if stock_bases:
         print(f"[歷史基底] 使用{bases_source}", flush=True)
     else:
@@ -2659,26 +2701,14 @@ async def main_async() -> None:
             loop.run_in_executor(None, build_baseline, stock_bases, feed, "雷達自動補算"))
         bl_text += "\n⏳ 已啟動自動補算（約 15～20 分鐘），完成前不會有盤中訊號，完成後自動啟用"
 
-    liquid_n = sum(1 for b in stock_bases.values() if b["liquid"])
-    startup = [
-        "📡 <b>【飆股雷達 v61】即時監控啟動（A+B+C＋二次確認）</b>",
-        f"行情：富邦 Neo API 快照（每 {POLL_INTERVAL} 秒）｜歷史：TWSE/TPEx 官方",
-        f"歷史基底：{bases_source}｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張共 {liquid_n} 檔",
-        bl_text,
-        precompute_summary(stock_bases),
-        hist_text,
-        watch_text,
-        f"A（四擇一）：A1 均線突破首日｜A2 開盤 > 昨高 ×{GAP_RATIO}｜A3 均線糾結（MA5/10/20 差距 ≤ {A3_SQUEEZE_PCT:g}%）後突破群高點"
-        f"｜A4 延後量能確認（觀察池內量能補到位）",
-        f"B：累積量 ≥ 5 日同期均量 ×{VOL_SURGE} 且 ≥ 昨日同期量",
-        f"C：預估成交額 > {MIN_EST_TURNOVER / 1e8:.0f} 億、現價 > 開盤、漲幅 +{CHG_MIN:.0f}%～+{CHG_MAX:.0f}%",
-        f"判斷時段 09:{EVAL_START_MINUTE:02d}～13:30（避開集合競價）｜二次確認：連續兩輪掃描都符合才通知｜同一檔當天只通知一次｜13:35 收盤確認",
-    ]
+    print(f"[盤前預算] {precompute_summary(stock_bases)}", flush=True)      # 盤前預算摘要只留在 log，不放 Telegram
+    notes = []
     if STATE["triggered"]:
-        startup.append(f"續跑：今日已觸發 {len(STATE['triggered'])} 檔，不會重複通知")
+        notes.append(f"續跑：今日已觸發 {len(STATE['triggered'])} 檔，不會重複通知")
     if HIGH_FALLBACK["rows"] > 100:
-        startup.append(f"⚠️ 官方資料有 {HIGH_FALLBACK['rows']} 筆沒有最高價欄位、改用收盤價，A2 可能不準")
-    await loop.run_in_executor(None, send_telegram, "\n".join(startup))
+        notes.append(f"⚠️ 官方資料有 {HIGH_FALLBACK['rows']} 筆沒有最高價欄位、改用收盤價，A2 可能不準")
+    startup = build_startup_message(stock_bases, bases_from_cache, bl_text, hist_text, watch_text, notes)
+    await loop.run_in_executor(None, send_telegram, startup)
 
     fail_streak, fail_alerted, fail_started = 0, False, None
     polls = 0
