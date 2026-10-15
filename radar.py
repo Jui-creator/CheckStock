@@ -1,4 +1,4 @@
-"""飆股雷達 v62：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
+"""飆股雷達 v64：1～2 週短線波段「A + B + C ＋ 二次確認」進場策略（富邦 Neo API 即時行情）。
 【進場條件】09:05～13:30 每 15 秒一輪；同時滿足 A 之一 + B 兩項 + C 全部，且「連續二次掃描都成立」才發 Telegram
             （同一檔同一天只發一次）：
   A（四擇一，滿足任一項即可）
@@ -31,10 +31,12 @@
      下一輪（約 15～30 秒後）必須再次同時符合才發通知；下一輪沒再符合就移出觀察池，過濾點火後撤單的假突破。
 【通知】
   開盤前（08:xx 啟動）：發一則「即時監控啟動」訊息，依區塊（行情與歷史基底 / 均量與同期量基準 / 強勢股池 / 突破觀察池 / 規則）分段顯示。
+  開盤前另發一則「📖 狀態說明」：強勢股池各狀態與移出規則的完整說明（STATE_LEGEND_ENABLED = False 可關閉）。
   盤中：二次確認通過立即通知（一則訊息只含一檔股票，逐則送出、間隔 1 秒；標題直接寫標籤，例如「🛡️ 【拉回再發動】 1815 富喬」），並附「MA5 減碼參考價」（= 前 4 日收盤均價；收盤價跌破它，就是收盤跌破 MA5）。
   收盤（13:35）：用最終收盤資料把 A+B+C 重算一次，Telegram 分 3 則獨立訊息（依類別分流，各有圖示標題），再傳 2 份 CSV：
         ① 📊 大盤與強勢股異動：大盤 MA20 格局、強勢股池檔數、今日被移出的股票（跌破 MA10 / 突破日低點）。
         ② ✅ 收盤確認通過：核心進場標的，每檔 3 行（代號型態收盤漲幅 / 量額與 MA5 減碼價 / 族群），依成交額大到小。
+        ④ 📖 狀態說明｜拉回整理中：只列「拉回整理中」的定義與符合的股票（收盤在 MA5 下、守住 MA10 與突破日低點）。
         ③ 👀 觀察與未過濾清單：突破觀察池（價格先突破、量能未達標；A4 的候選股），不列「盤中觸發但收盤未過」的股票。
         CSV：daily_report.csv（盤中通知 + 收盤確認整合，含盤中觸發但收盤未過的明細）、strong_pool.csv（強勢股池明細）。
   出場、停損、持倉追蹤都不做，由你自行判斷（第一階段收盤跌破 MA5 減碼一半、第二階段收盤跌破 MA10 清倉）。
@@ -48,6 +50,12 @@
     🚀 強勢突破   不在強勢股池（沒有通過紀錄，或已被移出）
     🛡️ 拉回再發動 在池中，且之後曾「收盤」跌破 MA5，但守住 MA10 與突破日低點（拉回整理後再度帶量突破）
     🔥 連續強勢   在池中，且之後收盤從未跌破 MA5（沒有拉回，續攻）
+  強勢股池的 5 種狀態（開盤前啟動訊息、收盤「拉回整理中」訊息、strong_pool.csv 共用同一套判斷）：
+    🚀 新入池      池中最早的突破訊號就是今天（不在池中 → 通過 A+B+C）
+    🔥 再度突破    已在池中，今天又通過 A+B+C
+    🔥 連續強勢    上次突破後，收盤從未跌破 MA5
+    📉 拉回整理中  收盤跌破 MA5，但守住 MA10 與突破日低點（留池觀察，MA5 減碼 / 防守提醒）
+    🛡️ 已站回 MA5  上次突破後曾收盤跌破 MA5，最近收盤已重新站回 MA5 之上
   初次建立或補洞：手動執行 history_backfill.yml（python radar.py --backfill），用官方日資料逐日回算並套用同一套移出規則。
 【檔案】
   breakout_watch.json   突破觀察池（A+C 成立但量能未達標的股票，最多觀察 5 個交易日；每日收盤確認後更新）
@@ -91,7 +99,9 @@ IC_CACHE_FILE = BASE_DIR / "ic_sector_cache.json"
 REPORT_CSV_FILE = BASE_DIR / "daily_report.csv"
 POOL_CSV_FILE = BASE_DIR / "strong_pool.csv"
 BASELINE_RULE = "v50"               # baseline.py 與 radar.py 必須一致
-RADAR_VERSION = "v62"               # 顯示在啟動訊息與 log；改版時只要改這一行
+RADAR_VERSION = "v64"               # 顯示在啟動訊息與 log；改版時只要改這一行
+STATE_LEGEND_ENABLED = True         # 開盤前啟動訊息之後，是否另發一則「狀態說明」（熟悉後可改 False）
+PULLBACK_LIST_MAX = 15              # 收盤「拉回整理中」訊息最多列出幾檔
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -1400,20 +1410,188 @@ def history_tag(hist: dict, code: str, today: str):
     }
 
 
+# 強勢股池狀態：(key, 圖示, 短名, CSV「狀態」欄文字)；順序即顯示順序
+POOL_STATES = (
+    ("new", "🚀", "新入池", "今日新入池"),
+    ("again", "🔥", "再度突破", "今日再度突破"),
+    ("streak", "🔥", "連續強勢", "連續強勢"),
+    ("pullback", "📉", "拉回整理中", "拉回整理中（收盤在MA5下）"),
+    ("recovered", "🛡️", "已站回MA5", "曾拉回、已站回MA5"),
+)
+POOL_STATE_TEXT = {k: text for k, _i, _s, text in POOL_STATES}
+
+
+def pool_state(hist: dict, code: str, rec: dict, day: str, close, ma5, tag: dict = None):
+    """強勢股池中某一檔在「day 收盤後」的狀態 key（POOL_STATES）。判斷順序：
+    池中最早突破日 = day → new；最近突破日 = day → again；收盤 < MA5 → pullback；
+    上次突破後曾收盤跌破 MA5（現已站回）→ recovered；其餘 → streak。"""
+    sigs = rec.get("signals") or []
+    if not sigs:
+        return None
+    if sigs[0]["date"] == day:
+        return "new"
+    if sigs[-1]["date"] == day:
+        return "again"
+    if close and ma5 and close < ma5:
+        return "pullback"
+    tag = tag or history_tag(hist, code, "9999-12-31")
+    return "recovered" if tag.get("kind") == "pullback" else "streak"
+
+
+def pool_state_groups(hist: dict, day: str, closes: dict = None, bases: dict = None) -> dict:
+    """把強勢股池依狀態分組：{key: [{code, name, close, ma5, ma10, low, back}]}。
+    收盤資料優先序：closes（當天收盤，含當天 MA）→ bases（官方基底：昨收與昨日 MA，基準日必須等於 day）→ 池中紀錄最近一筆。
+    back = 下一個交易日要「站回 MA5」收盤價必須高於的價位：
+           盤後（有 closes）用 (收盤 + 前 3 日收盤合計) / 4；盤前（用 bases）用 MA5 減碼參考價（前 4 日收盤均價）。"""
+    groups = {k: [] for k, *_ in POOL_STATES}
+    for code, rec in (hist or {}).get("stocks", {}).items():
+        sigs = rec.get("signals") or []
+        if not sigs:
+            continue
+        base = (bases or {}).get(code)
+        cur, back = None, None
+        if closes and closes.get(code) is not None:
+            cur = tuple(closes[code])
+            if base and base.get("sum_3") and cur[0]:
+                back = (cur[0] + base["sum_3"]) / 4
+        elif base and str(base.get("asof_date")) == day:
+            cur = (base["yest_close"], base["true_ma5"], base["true_ma10"])
+            back = base.get("ma5_cut")
+        elif rec.get("track"):
+            cur = tuple(rec["track"][max(rec["track"])])
+        close, ma5, ma10 = cur if cur else (None, None, None)
+        key = pool_state(hist, code, rec, day, close, ma5)
+        if key is None:
+            continue
+        groups[key].append({"code": code, "name": rec.get("name", code), "close": close, "ma5": ma5,
+                            "ma10": ma10, "low": sigs[-1].get("low"), "back": back,
+                            "last_date": sigs[-1]["date"]})
+    return groups
+
+
+def pool_state_line(groups: dict) -> str:
+    """「🚀新入池 2｜🔥再度突破 1｜🔥連續強勢 15｜📉拉回整理中 12｜🛡️已站回MA5 2」（0 檔的不列）。"""
+    return "｜".join(f"{icon}{short} {len(groups[k])}" for k, icon, short, _t in POOL_STATES if groups.get(k))
+
+
+def defense_level(it: dict):
+    """離移出線最近的防守價：MA10 與突破日低點取較高者。回傳 (價位, 名稱) 或 None。"""
+    ma10, low = it.get("ma10"), it.get("low")
+    if low and (not ma10 or low > ma10):
+        return low, "突破日低點"
+    if ma10:
+        return ma10, "MA10"
+    return None
+
+
+def pullback_rows(items: list) -> list:
+    """拉回整理中的每檔兩行文字，依「離防守價最近」排序（最危險的排前面）。回傳 [(距離%, 文字)]。"""
+    rows = []
+    for it in items:
+        close, ma5 = it.get("close"), it.get("ma5")
+        lvl = defense_level(it)
+        if not close or not ma5 or not lvl:
+            continue
+        gap = (close / lvl[0] - 1) * 100
+        line1 = f"<b>{it['code']} {it['name']}</b>｜收 {close:.2f} 低於 MA5 {ma5:.2f}"
+        parts = []
+        if it.get("back"):
+            parts.append(f"↗ 站回 MA5 需收盤 > {it['back']:.2f}")
+        parts.append(f"🛑 防守 {lvl[0]:.2f}（{lvl[1]}，距 {gap:+.1f}%）")
+        rows.append((gap, line1 + "\n" + "｜".join(parts)))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def build_pullback_message(day_str: str, items: list) -> str:
+    """📖 盤後只列「拉回整理中」的狀態說明與符合的股票。items = pool_state_groups()["pullback"]。"""
+    rows = pullback_rows(items)
+    lines = [f"📖 <b>【狀態說明】拉回整理中｜{day_str}</b>",
+             "",
+             "📉 <b>拉回整理中</b>",
+             "在池中，今日收盤跌破 MA5，但守住 MA10 與突破日低點 → 留池續觀察，作為 MA5 減碼 / 防守提醒",
+             "",
+             f"符合的股票：{len(rows)} 檔（離防守價最近的排前面）"]
+    if not rows:
+        lines.append("目前沒有股票處於拉回整理中。")
+    for _gap, text in rows[:PULLBACK_LIST_MAX]:
+        lines += ["", text]
+    if len(rows) > PULLBACK_LIST_MAX:
+        lines += ["", f"…另有 {len(rows) - PULLBACK_LIST_MAX} 檔（完整名單見 strong_pool.csv）"]
+    return "\n".join(lines)
+
+
 def apply_history(bases: dict, hist: dict, today: str) -> str:
-    """盤前：把每檔的標籤先算好掛在 base["hist"]（盤中直接讀）。回傳摘要文字。"""
-    n = {"first": 0, "pullback": 0, "streak": 0}
+    """盤前：把每檔的標籤先算好掛在 base["hist"]（盤中直接讀）。回傳啟動訊息用的強勢股池摘要（截至前一交易日收盤）。
+    狀態檔數用官方基底的昨收與昨日 MA 判斷（不依賴池中紀錄是否齊全）。"""
     for code, base in bases.items():
-        tag = history_tag(hist, code, today)
-        base["hist"] = tag
-        if base.get("liquid"):
-            n[tag["kind"]] += 1
+        base["hist"] = history_tag(hist, code, today)
     days = [d for d in hist["days"] if d < today]
     if not days:
         return "強勢股池：尚無紀錄（請先手動執行 history_backfill 回算），本日全部標為「強勢突破」"
-    return (f"強勢股池：{n['pullback'] + n['streak']} 檔（🔥連續強勢 {n['streak']}、🛡️拉回 {n['pullback']}）\n"
-            f"規則：收盤跌破 MA10 或突破日低點即移出\n"
-            f"紀錄區間 {days[0]}～{days[-1]}")
+    groups = pool_state_groups(hist, days[-1], None, bases)
+    total = sum(len(v) for v in groups.values())
+    lines = [f"強勢股池：{total} 檔（截至 {_mmdd(days[-1])} 收盤）"]
+    if total:
+        lines.append(pool_state_line(groups))
+    lines += ["規則：收盤跌破 MA10 或突破日低點即移出", f"紀錄區間 {days[0]}～{days[-1]}"]
+    return "\n".join(lines)
+
+
+def build_state_legend() -> str:
+    """📖 狀態說明：開盤前啟動訊息之後另發一則（STATE_LEGEND_ENABLED = False 可關閉）。
+    狀態名稱與圖示和啟動訊息、收盤訊息、strong_pool.csv 完全一致。"""
+    lines = [
+        "📖 <b>【狀態說明】強勢股的各種狀態</b>",
+        "",
+        "🚀 <b>今日新入池</b>",
+        "不在強勢股池，當天通過 A+B+C → 加入強勢股池（盤中通知標題為「🚀 強勢突破」，最終以 13:35 收盤確認為準）",
+        "",
+    ]
+    if A4_ENABLED:
+        lines += [
+            "⏳ <b>延後量能確認（A4）</b>",
+            "原本在突破觀察池，量能補到位、價格仍站上均線且守住突破價 → 盤中以「⏳ 延後量能確認」通知；"
+            "收盤確認通過後轉入強勢股池（歸類為 🚀 新入池）",
+            "",
+        ]
+    lines += [
+        "🔥 <b>今日再度突破</b>",
+        "已在強勢股池，今天又通過 A+B+C",
+        "",
+        "🔥 <b>連續強勢</b>",
+        "在池中，上次突破後收盤從未跌破 MA5",
+        "",
+        "📉 <b>拉回整理中</b>",
+        "在池中，今日收盤跌破 MA5，但守住 MA10 與突破日低點 → 留池續觀察，作為 MA5 減碼 / 防守提醒",
+        "",
+        "🛡️ <b>曾拉回、已站回 MA5</b>",
+        "曾收盤跌破 MA5，今日收盤重新站回 MA5 之上 → 拉回整理結束",
+        "",
+    ]
+    if A4_ENABLED:
+        lines += [
+            "👁️ <b>突破觀察中（等量能到位）</b>",
+            f"A（型態）+ C 成立，但 B 量能未達標 → 進突破觀察池，最多觀察 {WATCH_DAYS} 個交易日",
+            "",
+        ]
+    lines += [
+        "❌ <b>移出強勢股池</b>",
+        f"收盤跌破 MA10，或收盤跌破最近一次突破日的最低價；最近一次突破超過 {HISTORY_DAYS} 個交易日也會到期移出",
+    ]
+    if A4_ENABLED:
+        lines += [
+            "",
+            "❌ <b>移出突破觀察池</b>",
+            f"收盤跌破 MA10 或突破日低點；或超過 {WATCH_DAYS} 個交易日量能仍未到位",
+        ]
+    lines += [
+        "",
+        "📌 <b>盤中通知標題對照</b>",
+        "🚀 強勢突破（不在池）｜🔥 連續強勢（池中、未破 MA5）｜🛡️ 拉回再發動（池中、曾破 MA5）"
+        + ("｜⏳ 延後量能確認（A4）" if A4_ENABLED else ""),
+    ]
+    return "\n".join(lines)
 
 
 TAG_TITLE = {"first": ("🚀", "強勢突破"), "pullback": ("🛡️", "拉回再發動"), "streak": ("🔥", "連續強勢"),
@@ -2128,16 +2306,7 @@ def build_pool_rows(hist: dict, watch: dict, resets: list, wout: list, closes: d
         first, last = sigs[0], sigs[-1]
         close, ma5, ma10 = px(code, rec)
         tag = history_tag(hist, code, "9999-12-31")
-        if first["date"] == day:
-            status = "今日新入池"
-        elif last["date"] == day:
-            status = "今日再度突破"
-        elif close and ma5 and close < ma5:
-            status = "拉回整理中（收盤在MA5下）"
-        elif tag.get("kind") == "pullback":
-            status = "曾拉回、已站回MA5"
-        else:
-            status = "連續強勢"
+        status = POOL_STATE_TEXT[pool_state(hist, code, rec, day, close, ma5, tag)]
         dd = tag.get("max_dd")
         market, industry = meta(code)
         pool.append({
@@ -2535,7 +2704,7 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
 
     # 強勢股池：先移出今天收盤跌破 MA10 / 突破日低點的，再把今天通過的加進去
     hist_note = ""
-    hist, resets, watch, wout, closes = None, [], None, [], {}
+    hist, resets, watch, wout, closes, pool_groups = None, [], None, [], {}, None
     try:
         hist = load_history()
         closes = {}
@@ -2550,6 +2719,8 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
             [{"code": r["code"], "name": r["name"], "price": r["price"], "kind": r["kind"], "low": r.get("low"), "val": r.get("val")} for r in passed],
             closes)
         save_history(hist)
+        pool_groups = pool_state_groups(hist, today_str, closes, bases)
+        print(f"[強勢股池] 狀態：{pool_state_line(pool_groups) or '空'}", flush=True)
         print(f"[強勢股池] 已寫入 {today_str}：通過 {len(passed)} 檔、移出 {len(resets)} 檔，池中共 {len(hist['stocks'])} 檔、{len(hist['days'])} 個交易日", flush=True)
     except Exception as exc:
         hist_note = f"⚠️ 強勢股池寫入失敗（{type(exc).__name__}: {exc}），明天的標籤可能不準，可手動執行 history_backfill 補回"
@@ -2609,13 +2780,14 @@ async def run_close_confirm(bases: dict, baselines: dict, feed, loop, today: dat
                 })
             items.sort(key=lambda it: -it["_val"])
         msg3 = build_watch_message(items, watch_stats)
-    for i, message in enumerate([msg1] + msgs2 + ([msg3] if msg3 else [])):
+    msg4 = build_pullback_message(today_str, pool_groups["pullback"]) if pool_groups is not None else None
+    for i, message in enumerate([msg1] + msgs2 + ([msg3] if msg3 else []) + ([msg4] if msg4 else [])):
         if i:
             await asyncio.sleep(1.0)                       # Telegram 同一聊天室每秒限 1 則
         await loop.run_in_executor(None, send_telegram, message)
     n_signals = len(STATE["signals"])
     print(f"[收盤確認] 已送出收盤訊息：大盤與強勢股 1 則、通過 {len(passed)} 檔（{len(msgs2)} 則）"
-          f"{'、觀察清單 1 則' if msg3 else ''}｜盤中共 {n_signals} 則訊號", flush=True)
+          f"{'、觀察清單 1 則' if msg3 else ''}{'、拉回整理中 1 則' if msg4 else ''}｜盤中共 {n_signals} 則訊號", flush=True)
 
     # 每日整合報告（盤中通知 + 收盤確認，每檔一列）
     # 只放「收盤通過」或「盤中通知過」的股票（passed + failed）；觀察池候選另見 strong_pool.csv
@@ -2709,6 +2881,9 @@ async def main_async() -> None:
         notes.append(f"⚠️ 官方資料有 {HIGH_FALLBACK['rows']} 筆沒有最高價欄位、改用收盤價，A2 可能不準")
     startup = build_startup_message(stock_bases, bases_from_cache, bl_text, hist_text, watch_text, notes)
     await loop.run_in_executor(None, send_telegram, startup)
+    if STATE_LEGEND_ENABLED:
+        await asyncio.sleep(1.0)                           # Telegram 同一聊天室每秒限 1 則
+        await loop.run_in_executor(None, send_telegram, build_state_legend())
 
     fail_streak, fail_alerted, fail_started = 0, False, None
     polls = 0
