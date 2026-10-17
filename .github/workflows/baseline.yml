@@ -1,14 +1,22 @@
-name: 夜間運算（日K・R矩陣・法人・B候選）
+name: 夜間運算（日K・分時量矩陣・法人・A1/A2/B 候選池）
 on:
-  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚觸發（建議 18:00 之後），
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚（18:00 之後）以 workflow_dispatch 觸發，
   # 也可到 Actions 頁面點「Run workflow」手動執行。
-  # v68 產出三個檔案，一起 commit 回 repo：
-  #   stock_bases.json      歷史基底（富邦日 K：均線、5 日均量、B 型態候選、A2 整理期標記、法人近 5 日）
-  #   volume_baseline.json  分時累積佔比 R 矩陣（富邦 1 分 K：近 20 日中位數，與全市場曲線 70:30 混合）
-  #   initial_pools.json    B 池夜間候選（KD<40 金叉 + 爆量 + 型態 + 法人 T 日合計淨買賣超 ≥ 0）
-  # 耗時：日 K 約 13 分鐘；1 分 K 約 13 分鐘（若富邦一次回傳不完整，程式會自動改成 5 日一段，約 54 分鐘）；
+  # v69 產出兩個檔案，一起 commit 回 repo：
+  #   initial_pools.json   隔日盤中唯一使用的靜態資料（A1 候選池、A2 追蹤池、B 候選池、分時量矩陣 volume_time_matrix、
+  #                        兩個市場的前 19 日指數收盤、法人參考、候選股的均線 / 均量基底）。原子寫入，資料不完整時不覆寫前一版。
+  #   signal_history.json  追蹤清單（A1 收盤確認 → A2 追蹤池、B 池等待日數）。radar 13:35 沒結算成功時，這裡用官方日 K 補結算。
+  # 耗時：日 K 約 13 分鐘；1 分 K 只抓候選股（約 3～10 分鐘；若富邦一次回傳不完整，程式會自動改成 5 日一段，約 4 倍）；
   #       官方法人 T 日資料還沒出來時最多再等 4 × 3 分鐘。以上都是依限速推估，第一次執行請看實際耗時。
+  # 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json 時，重複觸發（例如 Apps Script 重試）會直接結束；
+  #               要強制重跑，手動執行時勾選 force。
   workflow_dispatch:
+    inputs:
+      force:
+        description: "強制重跑（忽略「今天已成功產出」的重複觸發保護）"
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: write
 concurrency:
@@ -52,6 +60,7 @@ jobs:
           FUBON_ID: ${{ secrets.FUBON_ID }}
           FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
           FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
           python -u baseline.py
       - name: 刪除憑證
@@ -63,14 +72,16 @@ jobs:
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
-      # 基準檔 commit 回 repo，隔天雷達（daily.yml）checkout 後讀取。
+      # 夜間結果 commit 回 repo，隔天雷達（daily.yml）checkout 後讀取。
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和雷達的 commit 衝突；3 次都失敗才算失敗。
       - name: 儲存夜間運算結果回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add volume_baseline.json stock_bases.json initial_pools.json
+          for f in initial_pools.json signal_history.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
           git diff --staged --quiet && exit 0
           git commit -m "更新夜間運算 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
