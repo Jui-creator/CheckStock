@@ -1,8 +1,13 @@
-name: 同期量基準盤後計算
+name: 夜間運算（日K・R矩陣・法人・B候選）
 on:
-  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚觸發（建議 18:00~19:00），
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚觸發（建議 18:00 之後），
   # 也可到 Actions 頁面點「Run workflow」手動執行。
-  # 產出 volume_baseline.json（同期量基準）與 stock_bases.json（歷史基底快取），兩個一起 commit 回 repo。
+  # v68 產出三個檔案，一起 commit 回 repo：
+  #   stock_bases.json      歷史基底（富邦日 K：均線、5 日均量、B 型態候選、A2 整理期標記、法人近 5 日）
+  #   volume_baseline.json  分時累積佔比 R 矩陣（富邦 1 分 K：近 20 日中位數，與全市場曲線 70:30 混合）
+  #   initial_pools.json    B 池夜間候選（KD<40 金叉 + 爆量 + 型態 + 法人 T 日合計淨買賣超 ≥ 0）
+  # 耗時：日 K 約 13 分鐘；1 分 K 約 13 分鐘（若富邦一次回傳不完整，程式會自動改成 5 日一段，約 54 分鐘）；
+  #       官方法人 T 日資料還沒出來時最多再等 4 × 3 分鐘。以上都是依限速推估，第一次執行請看實際耗時。
   workflow_dispatch:
 permissions:
   contents: write
@@ -14,7 +19,7 @@ env:
 jobs:
   baseline:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +45,7 @@ jobs:
             ic-sector-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
-      - name: 計算同期量基準
+      - name: 夜間運算
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -60,14 +65,14 @@ jobs:
           key: ic-sector-${{ github.run_id }}
       # 基準檔 commit 回 repo，隔天雷達（daily.yml）checkout 後讀取。
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和雷達的 commit 衝突；3 次都失敗才算失敗。
-      - name: 儲存基準回 repo
+      - name: 儲存夜間運算結果回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add volume_baseline.json stock_bases.json
+          git add volume_baseline.json stock_bases.json initial_pools.json
           git diff --staged --quiet && exit 0
-          git commit -m "更新同期量基準 $(date '+%Y-%m-%d')"
+          git commit -m "更新夜間運算 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && exit 0
             echo "push 第 $i 次失敗，5 秒後重試"
