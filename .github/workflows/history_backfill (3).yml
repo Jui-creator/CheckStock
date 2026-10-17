@@ -1,0 +1,80 @@
+name: 一次性補歷史（B 池與 A2 追蹤池）
+on:
+  # 上線時只跑一次，手動到 Actions 頁面點「Run workflow」。不使用 schedule，也不需要 Apps Script 觸發。
+  # 跑完會把 signal_history.json 與 backfill_report.csv commit 回 repo；接著請手動跑一次 baseline（勾 force）。
+  workflow_dispatch:
+    inputs:
+      all_market:
+        description: "掃全市場（約 1,900 檔、約 40 分鐘）；不勾 = 只抓成交量預篩後的約 750 檔（約 15 分鐘）"
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: "signal_history.json 已有內容時仍要執行（只新增不存在的代號）"
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: write
+concurrency:
+  group: volume-baseline
+  cancel-in-progress: false
+env:
+  PYTHONUNBUFFERED: "1"
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安裝套件與富邦 SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests aiohttp
+          pip install vendor/fubon_neo-*.whl
+      - name: 還原憑證
+        run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
+      - name: 補歷史
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FUBON_ID: ${{ secrets.FUBON_ID }}
+          FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
+          FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+          BACKFILL_ALL: ${{ github.event.inputs.all_market }}
+          BACKFILL_FORCE: ${{ github.event.inputs.force }}
+        run: |
+          python -u backfill_history.py
+      - name: 刪除憑證
+        if: always()
+        run: rm -f fubon.p12
+      - name: 儲存結果回 repo
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for f in signal_history.json backfill_report.csv; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          git diff --staged --quiet && exit 0
+          git commit -m "一次性補歷史 $(date '+%Y-%m-%d')"
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            echo "push 第 $i 次失敗，5 秒後重試"
+            sleep 5
+          done
+          exit 1
+      - name: 上傳報表
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-report
+          path: |
+            backfill_report.csv
+            signal_history.json
+          if-no-files-found: ignore
