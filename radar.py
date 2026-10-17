@@ -596,17 +596,24 @@ class FubonFeed:
             return self.index_syms
         out, names = {"tse": None, "otc": None}, []
         try:
-            with self.lock:
-                idx = self.stock.intraday.tickers(type="INDEX")
-            rows = idx.get("data", []) if isinstance(idx, dict) else []
-            names = [(str(x.get("symbol")), str(x.get("name"))) for x in rows]
-            for sym, nm in names:
+            listed = []                                       # (交易所, 代號, 名稱)
+            for ex in ("TWSE", "TPEx"):
+                try:
+                    with self.lock:
+                        r = self.stock.intraday.tickers(type="INDEX", exchange=ex)
+                    for x in ((r.get("data") if isinstance(r, dict) else None) or []):
+                        listed.append((ex, str(x.get("symbol")), str(x.get("name"))))
+                except Exception as exc2:
+                    print(f"[富邦] 查詢 {ex} 指數清單失敗：{type(exc2).__name__}: {exc2}", flush=True)
+            names = [(s, n) for _, s, n in listed]
+            for ex, sym, nm in listed:
                 if "報酬" in nm:
                     continue
-                if out["tse"] is None and "加權" in nm:
+                if out["tse"] is None and ex == "TWSE" and "加權" in nm:
                     out["tse"] = sym
-                if out["otc"] is None and ("櫃買" in nm or "櫃檯" in nm):
+                if out["otc"] is None and ex == "TPEx" and ("櫃買" in nm or "櫃檯" in nm):
                     out["otc"] = sym
+            print(f"[富邦] 櫃買(TPEx)指數清單：{[(s, n) for e, s, n in listed if e == 'TPEx']}", flush=True)
         except Exception as exc:
             print(f"[富邦] 查詢指數清單失敗：{type(exc).__name__}: {exc}", flush=True)
         if out["tse"] is None:
