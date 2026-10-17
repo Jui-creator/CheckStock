@@ -1,4 +1,4 @@
-"""夜間運算 baseline.py（v69）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
+"""夜間運算 baseline.py（v69.1）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
 價格與成交量全部來自富邦 Neo API；法人用官方資料（外資＋投信，只當參考）。建議 18:00 之後由 Google Apps Script 呼叫 baseline.yml（workflow_dispatch）觸發。
 流程：
   0. 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json → 直接結束（要強制重跑：workflow 手動執行時勾選 force，或環境變數 FORCE=1）
@@ -8,19 +8,109 @@
   3. B 池：KD 低檔金叉＋爆量＋收盤位置，通過者併入 B 池（等待最多 5 個交易日）
   4. 候選池：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ 昨日最高均線）、A2 追蹤池（收盤確認的 A1，10 個交易日內）、B 候選池
   5. 分時量矩陣：只替候選股抓 1 分 K，預先算好「開盤後每分鐘的歷史同期累積佔比」（近 20 日中位數，與全市場曲線 70:30 混合）→ volume_time_matrix
-  6. 官方法人（證交所 T86 ＋ 櫃買）近 5 日；沒出齊會重試；仍沒有 → 富邦補 B 候選。只記錄、不篩選
+  6. 官方法人（證交所 T86 ＋ 櫃買）近 5 日；只記錄、不篩選。
+     v69.1：櫃買表頭沒有法人名稱（買進/賣出/買賣超股數重複 7 組）→ 依固定位置解析，並用「三大法人合計」驗算；
+            格式問題（欄位無法辨識）不再重試等待；法人整段失敗也不會讓夜間運算失敗（只是法人參考欄位為空）
   7. 加權、櫃買指數最近 19 個完整交易日收盤（隔天算盤中即時月線）
   8. 原子寫入 initial_pools.json（暫存檔 → fsync → os.replace），再存 signal_history.json。任何一步資料不完整 → 不覆寫前一版 initial_pools.json
+需要同資料夾的 radar.py（v69：夜間／盤中共用函式都在那裡）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
 import sys
+import time
 import asyncio
 from datetime import date
 
 import radar as rd
 
 
+# =========================
+# v69.1 法人解析修正（放在 baseline.py，不需要改 radar.py；對 radar.py 已有修正的版本也無害）
+# =========================
+_TPEX_GROUPS = 7                      # 櫃買：外資(不含外資自營商)、外資自營商、外資合計、投信、自營商自行買賣、自營商避險、自營商合計
+
+
+def _parse_tpex_positional(fields, rows):
+    """櫃買三大法人日報：代號、名稱 + 7 組（買進股數/賣出股數/買賣超股數）+ 三大法人買賣超股數合計 = 24 欄，表頭沒有法人名稱 → 依固定位置解析。
+    組別：0 外資及陸資(不含外資自營商)、1 外資自營商、2 外資合計、3 投信、4 自營商(自行買賣)、5 自營商(避險)、6 自營商合計；組 g 的買賣超在第 4+3g 欄。
+    驗算：最後一欄（三大法人合計）= 組 2 買賣超 + 組 3 買賣超 + 組 6 買賣超；至少 95% 的列吻合才採用，否則回傳 None（寧可不用，也不寫錯的數字）。
+    外資取組 0（不含外資自營商），與證交所 T86 的口徑一致；投信取組 3。"""
+    if len(fields) != 2 + 3 * _TPEX_GROUPS + 1:
+        return None
+    stripped = [rd._strip_paren(f) for f in fields]
+    if "代號" not in stripped[0] or "合計" not in stripped[-1]:
+        return None
+    for g in range(_TPEX_GROUPS):
+        if stripped[2 + 3 * g:5 + 3 * g] != ["買進股數", "賣出股數", "買賣超股數"]:
+            return None
+    out, ok, total = {}, 0, 0
+    for row in rows:
+        try:
+            code = str(row[0]).strip()
+            if not rd.STOCK_CODE_RE.fullmatch(code) or len(row) < len(fields):
+                continue
+            total += 1
+            if abs(rd._num(row[23]) - (rd._num(row[10]) + rd._num(row[13]) + rd._num(row[22]))) <= 1:
+                ok += 1
+            out[code] = (rd._num(row[4]), rd._num(row[13]))
+        except (IndexError, TypeError):
+            continue
+    if total == 0 or ok / total < 0.95:
+        print(f"[法人] 櫃買位置解析的合計驗算不過（{ok}/{total} 吻合），不採用", flush=True)
+        return None
+    return out, f"外資 = 第1組買賣超（不含外資自營商）｜投信 = 第4組買賣超（位置解析，合計驗算 {ok}/{total} 吻合）"
+
+
+_orig_parse_inst_rows = rd.parse_inst_rows
+
+
+def _parse_inst_rows_v2(fields, rows):
+    """先用 radar.py 原本「依欄名找」的解析（證交所適用）；找不到欄位時，改試櫃買的固定位置解析。"""
+    res = _orig_parse_inst_rows(fields, rows)
+    if res[0] is not None:
+        return res
+    pos = _parse_tpex_positional(fields, rows)
+    if pos is not None:
+        return pos
+    return res
+
+
+def _fetch_inst_days_v2(days, retries=None, wait=None):
+    """同 radar.fetch_inst_days，差別：格式問題（欄位無法辨識 / 沒有資料表）不是「官方還沒公布」，立刻放棄，不再白等重試。
+    只有「尚無資料 / 連線失敗 / 回應日期不對」才會重試（最新一天最多 retries 次、每次等 wait 秒）。"""
+    retries = rd.INST_RETRIES if retries is None else retries
+    wait = rd.INST_RETRY_WAIT if wait is None else wait
+    out, notes = {}, []
+    for idx, day in enumerate(days):
+        latest = idx == len(days) - 1
+        res = {}
+        for mk in ("tse", "otc"):
+            tbl, note = None, ""
+            tries = retries if latest else 1
+            for attempt in range(1, tries + 1):
+                tbl, note = rd.fetch_inst_market(mk, day)
+                if tbl is not None:
+                    break
+                if note.startswith("欄位無法辨識") or note.startswith("回應沒有資料表"):
+                    break
+                if attempt < tries:
+                    print(f"[法人] {mk} {day} 尚未取得（{note}），{wait:.0f} 秒後重試（{attempt}/{tries}）", flush=True)
+                    time.sleep(wait)
+            res[mk] = tbl
+            if tbl is None:
+                notes.append(f"{'上市' if mk == 'tse' else '上櫃'} {day}：{note}")
+        out[day.isoformat()] = res
+    return out, notes
+
+
+rd.parse_inst_rows = _parse_inst_rows_v2
+rd.fetch_inst_days = _fetch_inst_days_v2
+
+
+# =========================
+# 主流程
+# =========================
 def _truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "y")
 
@@ -45,7 +135,7 @@ def already_done(feed):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("夜間運算 baseline.py v69（富邦日 K / 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
+    print("夜間運算 baseline.py v69.1（富邦日 K / 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
     print("=" * 55, flush=True)
     feed = rd.FubonFeed()
     try:
@@ -118,21 +208,29 @@ def main() -> int:
         print("[分時量矩陣] 失敗，未更新 initial_pools.json（保留前一版）", flush=True)
         return 1
 
-    # ---- 官方法人（放最後：1 分 K 跑完時官方資料比較可能已出齊）----
-    day_list = [date.fromisoformat(d) for d in rd.trading_days(feed, asof)[-rd.INST_DAYS:]]
-    inst_by_day, notes = rd.fetch_inst_days(day_list)
-    rd.attach_inst(bases, inst_by_day, day_list)
-    t = inst_by_day.get(asof_str) or {}
-    inst_meta = {"t_date": asof_str, "tse_ok": t.get("tse") is not None, "otc_ok": t.get("otc") is not None, "notes": notes[:6], "fubon_filled": 0,
-                 "days": [d.isoformat() for d in day_list], "note": "外資＋投信買賣超，只當參考，不是篩選條件"}
-    missing = sorted(c for c in pools["b"] if c in bases and bases[c].get("inst_t") is None)
-    if missing and rd.INST_FALLBACK_FUBON:
-        print(f"[法人] 官方沒拿到 {len(missing)} 檔 B 池標的的 T 日資料，改用富邦逐檔補", flush=True)
-        inst_meta["fubon_filled"] = rd.fubon_inst_fill(feed, bases, missing, asof)
-    for code, e in pools["b"].items():                      # 追蹤清單裡的 B 標的也更新法人參考
-        b = bases.get(code)
-        if b and b.get("inst5"):
-            e["inst5"], e["inst_t"] = b["inst5"], b.get("inst_t")
+    # ---- 官方法人（放最後：1 分 K 跑完時官方資料比較可能已出齊；只是參考，整段失敗也不影響夜間運算）----
+    inst_meta = {"t_date": asof_str, "tse_ok": False, "otc_ok": False, "notes": [], "fubon_filled": 0, "days": [],
+                 "note": "外資＋投信買賣超，只當參考，不是篩選條件"}
+    notes = []
+    try:
+        day_list = [date.fromisoformat(d) for d in rd.trading_days(feed, asof)[-rd.INST_DAYS:]]
+        inst_by_day, notes = rd.fetch_inst_days(day_list)
+        rd.attach_inst(bases, inst_by_day, day_list)
+        t = inst_by_day.get(asof_str) or {}
+        inst_meta.update(tse_ok=t.get("tse") is not None, otc_ok=t.get("otc") is not None, notes=notes[:6],
+                         days=[d.isoformat() for d in day_list])
+        missing = sorted(c for c in pools["b"] if c in bases and bases[c].get("inst_t") is None)
+        if missing and rd.INST_FALLBACK_FUBON:
+            print(f"[法人] 官方沒拿到 {len(missing)} 檔 B 池標的的 T 日資料，改用富邦逐檔補", flush=True)
+            inst_meta["fubon_filled"] = rd.fubon_inst_fill(feed, bases, missing, asof)
+        for code, e in pools["b"].items():                  # 追蹤清單裡的 B 標的也更新法人參考
+            b = bases.get(code)
+            if b and b.get("inst5"):
+                e["inst5"], e["inst_t"] = b["inst5"], b.get("inst_t")
+    except Exception as exc:
+        notes = [f"法人整段失敗：{type(exc).__name__}: {exc}"]
+        inst_meta["notes"] = notes
+        print(f"[法人] 整段失敗（不影響夜間運算，法人參考欄位為空）：{type(exc).__name__}: {exc}", flush=True)
 
     index_ctx = rd.index_regime_snapshot(feed, asof)
     if not index_ctx:
@@ -146,7 +244,7 @@ def main() -> int:
     meta, c = init["metadata"], init["metadata"]["counts"]
     n_a2 = sum(1 for e in init["A2_tracking_pool"].values() if rd.A2_MIN_DAYS <= ((e.get("a2") or {}).get("n") or 0) <= rd.A2_MAX_DAYS)
     nw = sum(1 for e in init["B_candidates"].values() if e.get("status") == "Watching")
-    lines = [f"📦 <b>【夜間運算 v69】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
+    lines = [f"📦 <b>【夜間運算 v69.1】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
              f"全市場 {market_total:,} 檔，達標（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔",
              f"🟢 A1 候選池 {c['a1']} 檔（昨收 ≤ 昨日最高均線）",
              f"🟢 A2 追蹤池 {c['a2']} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內），其中拉回整理 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天 {n_a2} 檔",
