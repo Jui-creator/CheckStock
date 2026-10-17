@@ -1,11 +1,18 @@
-name: 強勢股池回算
+name: 雙股池初始化與回測
 on:
   # 只手動執行：Actions 頁面點「Run workflow」。
-  # 用官方 TWSE/TPEx 日資料逐日回算過去 15 個交易日的收盤確認（A+B+C，含 A4 延後量能確認），並套用「收盤跌破 MA10 / 突破日低點即移出」規則，
-  # 重建 signal_history.json（強勢股池）與 breakout_watch.json（突破觀察池），commit 回 repo，並產生 strong_pool.csv 傳到 Telegram。
-  # 使用時機：第一次啟用強勢股池或 A4、升級規則版本、或某天收盤確認失敗導致歷史缺漏時。本次升級（加入 A4）建議先跑一次。
-  # 建議交易日 15:30 以後執行（官方當日資料約 15:00 後齊全），約 3～5 分鐘。不需要富邦登入。
+  # v67 的用途：用「富邦」日 K（historical.candles，原始價格）把「股池 A（右側突破）/ 股池 B（跌深反彈）」的規則逐日重播：
+  #   ① 重建 signal_history.json（兩個股池目前的狀態，commit 回 repo，隔天盤前雷達自動載入）
+  #   ② 產生回測績效（Telegram 摘要）與 backtest_trades.csv（逐筆交易）
+  # 使用時機：第一次啟用 v67、調整股池規則後想重新建池，或某天收盤結算失敗導致股池缺漏時。
+  # 建議交易日 17:00 以後執行（富邦歷史資料盤後 16:30 更新）。需要富邦登入（與 baseline.yml 相同的 Secrets）。
+  # 富邦歷史行情限速 60 次/分：約 700 檔，120 個交易日 ≈ 12～15 分鐘；超過 1 年（約 250 個交易日以上）會自動分段，時間加倍。
   workflow_dispatch:
+    inputs:
+      days:
+        description: "回測交易日數（30～250；預設 120）"
+        required: false
+        default: "120"
 
 permissions:
   contents: write
@@ -20,7 +27,7 @@ env:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,28 +37,44 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 安裝套件
+      - name: 檢查 SDK 檔案
+        run: |
+          ls -la vendor/
+          ls vendor/fubon_neo-*.whl
+
+      - name: 安裝套件與富邦 SDK
         run: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
+          pip install vendor/fubon_neo-*.whl
 
-      - name: 回算強勢股池與突破觀察池
+      - name: 還原憑證
+        run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
+
+      - name: 初始化雙股池並回測（富邦日 K）
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FUBON_ID: ${{ secrets.FUBON_ID }}
+          FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
+          FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
         run: |
-          python -u radar.py --backfill
+          python -u radar.py --backfill --days "${{ github.event.inputs.days || '120' }}"
+
+      - name: 刪除憑證
+        if: always()
+        run: rm -f fubon.p12
 
       - name: 儲存回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in signal_history.json breakout_watch.json; do
+          for f in signal_history.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
-          git commit -m "回算強勢股池與突破觀察池 $(date '+%Y-%m-%d')"
+          git commit -m "初始化雙股池 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && exit 0
             echo "push 第 $i 次失敗，5 秒後重試"
@@ -59,12 +82,12 @@ jobs:
           done
           exit 1
 
-      - name: 上傳強勢股池明細 CSV
+      - name: 上傳回測逐筆交易 CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: strong-pool
-          path: strong_pool.csv
+          name: backtest-trades
+          path: backtest_trades.csv
           if-no-files-found: ignore
 
       - name: 失敗通知
@@ -77,4 +100,4 @@ jobs:
           if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
           curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=❌ 【強勢股池回算】執行失敗：${RUN_URL}" > /dev/null || true
+            --data-urlencode "text=❌ 【雙股池初始化】執行失敗：${RUN_URL}" > /dev/null || true
