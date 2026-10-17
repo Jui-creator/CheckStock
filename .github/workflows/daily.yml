@@ -1,22 +1,22 @@
 name: 飆股雷達每日自動掃描
 on:
-  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天 08:00~09:00 之間觸發，
-  # 也可到 Actions 頁面點「Run workflow」手動執行。
-  # 程式啟動後會自己等到 09:00 才開始輪詢；13:24:45 後停止所有即時通知；13:35 起收盤結算，
-  # 暫緩收盤的個股最多等到 13:55 取得收盤價（取不到的會在報表標註「未取得收盤價」，不用 lastPrice 代替）。
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天 08:00~09:00 之間以 workflow_dispatch 觸發，
+  # 也可到 Actions 頁面點「Run workflow」手動執行。實際啟動時間不固定，所有時段判斷都由 radar.py 依台北時間自己處理：
+  #   09:00 前啟動 → 完成載入與自檢後等到 09:00；09:00~09:05 啟動 → 立即暖機，09:05 前不發個股訊號；
+  #   09:05 之後才啟動 → 視為延遲啟動（Telegram 警告），先暖機 2 輪再開放訊號；13:25 之後才啟動 → 只做 13:35 收盤結算。
+  # 程式 09:05 起每 15 秒一輪，13:24:45 後停止所有新的個股訊號；13:35 起收盤結算，暫緩收盤的個股最多等到 13:55 取得收盤價
+  # （取不到的會在報表標註「未取得收盤價」，不用 lastPrice 代替）。
+  # 重複觸發保護：同一交易日 stock_states.json 已標 COMPLETED 時，後續重複觸發（例如 Apps Script 重試）直接忽略；
+  # concurrency 保證同時只有一個雷達在跑（後到的排隊，前一個結束後看到 COMPLETED 就結束）。
   # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:55 = 355 分鐘，timeout 設 358 分鐘。
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: feigu-radar-daily
   cancel-in-progress: false
-
 env:
   PYTHONUNBUFFERED: "1"
-
 jobs:
   radar:
     runs-on: ubuntu-latest
@@ -24,23 +24,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: 設定 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: 檢查 SDK 檔案
         run: |
           ls -la vendor/
           ls vendor/fubon_neo-*.whl
-
       - name: 安裝套件與富邦 SDK
         run: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
-
       - name: 還原產業鏈快取
         uses: actions/cache/restore@v4
         with:
@@ -48,10 +44,8 @@ jobs:
           key: ic-sector-${{ github.run_id }}
           restore-keys: |
             ic-sector-
-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
-
       - name: 執行飆股雷達
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -62,29 +56,26 @@ jobs:
           # DEBUG_CODES: "2330,2317"   # 想看特定股票每輪的判斷數字時，取消註解並填代號
         run: |
           python -u radar.py
-
       - name: 刪除憑證
         if: always()
         run: rm -f fubon.p12
-
       - name: 儲存產業鏈快取
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
-
       # 要 commit 的檔案：
-      #   stock_states.json    當天已通知名單與護網凍結紀錄（程式中斷重跑時不會重複通知、凍結狀態會還原）
-      #   volume_baseline.json 雷達開盤時若發現 R 矩陣過期而自動補算，新檔也要存回 repo
-      #   signal_history.json  追蹤清單（A1 通知後 10 日內的 A 追蹤、B 追蹤；收盤結算後更新）
+      #   stock_states.json    當天已通知名單、市場趨勢（NORMAL/BEAR）狀態、執行鎖（程式中斷重跑時不會重複通知；COMPLETED 後重複觸發直接忽略）
+      #   signal_history.json  追蹤清單（A1 待收盤確認 → A2 追蹤池、B 池等待日數；收盤結算後更新）
+      # initial_pools.json 是夜間 baseline 產出、盤中唯讀，這裡不 commit。
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in stock_states.json volume_baseline.json signal_history.json; do
+          for f in stock_states.json signal_history.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
@@ -94,7 +85,6 @@ jobs:
             echo "push 第 $i 次失敗，5 秒後重試"
             sleep 5
           done || true
-
       # pool_report.csv：收盤結算後的追蹤清單明細（標題列寫明資料基準日；也會傳到 Telegram）
       - name: 上傳 CSV
         if: always()
@@ -106,7 +96,6 @@ jobs:
             signal_history.json
             stock_states.json
           if-no-files-found: ignore
-
       # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
       - name: 失敗通知
         if: failure() || cancelled()
