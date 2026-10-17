@@ -2,8 +2,9 @@ name: 飆股雷達每日自動掃描
 on:
   # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天 08:00~09:00 之間觸發，
   # 也可到 Actions 頁面點「Run workflow」手動執行。
-  # 程式啟動後會自己等到 09:00 才開始輪詢，13:35 收盤確認後結束。
-  # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:35 約 335 分鐘，timeout 設 355 分鐘。
+  # 程式啟動後會自己等到 09:00 才開始輪詢；13:24:45 後停止所有即時通知；13:35 起收盤結算，
+  # 暫緩收盤的個股最多等到 13:55 取得收盤價（取不到的會在報表標註「未取得收盤價」，不用 lastPrice 代替）。
+  # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:55 = 355 分鐘，timeout 設 358 分鐘。
   workflow_dispatch:
 
 permissions:
@@ -19,7 +20,7 @@ env:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 358
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,17 +75,16 @@ jobs:
           key: ic-sector-${{ github.run_id }}
 
       # 要 commit 的檔案：
-      #   stock_states.json    當天已觸發名單（程式中斷重跑時不會重複通知）
-      #   volume_baseline.json 雷達開盤時若發現基準檔過期而自動補算，新檔也要存回 repo
-      #   signal_history.json  強勢股池（收盤確認後更新：新通過的加入、收盤跌破 MA10 / 突破日低點的移出）
-      #   breakout_watch.json  突破觀察池（A4 用：價格先突破、量能未達標的股票；收盤確認後更新，最多觀察 5 個交易日）
+      #   stock_states.json    當天已通知名單與護網凍結紀錄（程式中斷重跑時不會重複通知、凍結狀態會還原）
+      #   volume_baseline.json 雷達開盤時若發現 R 矩陣過期而自動補算，新檔也要存回 repo
+      #   signal_history.json  追蹤清單（A1 通知後 10 日內的 A 追蹤、B 追蹤；收盤結算後更新）
       # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in stock_states.json volume_baseline.json signal_history.json breakout_watch.json; do
+          for f in stock_states.json volume_baseline.json signal_history.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
@@ -95,17 +95,16 @@ jobs:
             sleep 5
           done || true
 
-      # daily_report.csv：每日整合報告（盤中通知 + 收盤確認）；strong_pool.csv：強勢股池 / 突破觀察池 / 今日移出明細（兩份也會傳到 Telegram）
+      # pool_report.csv：收盤結算後的追蹤清單明細（標題列寫明資料基準日；也會傳到 Telegram）
       - name: 上傳 CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: radar-report
           path: |
-            daily_report.csv
-            strong_pool.csv
+            pool_report.csv
             signal_history.json
-            breakout_watch.json
+            stock_states.json
           if-no-files-found: ignore
 
       # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
