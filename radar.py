@@ -17,7 +17,7 @@
 【夜間（baseline.py）→ initial_pools.json】
   A1 候選池：5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ max(昨日 MA5/10/20)；隔天盤中 A1 只掃描這批，不在盤中重新篩全市場。
   A2 追蹤池：過去 10 個交易日內「收盤確認成功」的 A1（盤中通知過但收盤沒站穩的不進池）。
-  B 候選池：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
+  B 候選池（v69.2 全市場，不篩 5 日均量）：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
   volume_time_matrix：每檔候選股、開盤後每一分鐘的「歷史同期累積量佔比」全部夜間算好；盤中只查表，不碰歷史分 K。
   initial_pools.json 一律「暫存檔 → fsync → os.replace」原子寫入；資料不完整時不覆寫前一版。
 
@@ -121,7 +121,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v69"
+RADAR_VERSION = "v69.2"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -151,7 +151,7 @@ VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
 
 # ---- A2（二次加碼）----
 A2_ENABLED = True
-A2_MIN_DAYS, A2_MAX_DAYS = 1, 6     # 拉回整理：連續「收盤 < MA5 且 ≥ MA10 且 ≥ 突破日低點」1～6 天
+A2_MIN_DAYS, A2_MAX_DAYS = 2, 6     # 拉回整理：連續「收盤 < MA5 且 ≥ MA10 且 ≥ 突破日低點」2～6 天
 A2_VOL_RATIO = 1.2                  # 預估全日量 ≥ 整理期平均量 × 1.2
 A2_REQUIRE_VWAP = True              # 現價 > 即時 VWAP
 A_TRACK_DAYS = 10                   # A1 收盤確認後追蹤 10 個交易日
@@ -172,6 +172,10 @@ B_MIN_EST_TURNOVER = 200_000_000    # 預估全日成交金額 ≥ 2 億
 B_REQUIRE_MA5 = True                # 現價 > 即時 MA5
 B_REQUIRE_VWAP = True               # 現價 > 即時 VWAP（確認強度）
 B_STATUS_MISS_DAYS = 3              # 連續幾天抓不到收盤資料 → 資料缺失移出
+# v69.2：B 池「全市場」確認，不篩 5 日均量（1,000 張只限 A1 候選池）
+B_FULL_MARKET = True                # 夜間日 K 抓全市場（約 1,900 檔，約 37 分鐘）；False = 回到只抓成交量預篩後約 770 檔
+B_MIN_VOL5_LOTS = 0                 # B 候選的 5 日均量下限（張）；0 = 不篩（B 的篩選靠「爆量 ≥ 20 日均量 2 倍」與盤中預估成交額 ≥ 2 億）
+B_LOWLIQ_MIN_CANDLES = 5            # 5 日均量 < 1,000 張的 B 候選，1 分 K 一天最少幾根才算完整日（低量股很多分鐘沒有成交，不會有分 K）
 
 # ---- 法人（官方：證交所 T86、櫃買；只當參考，不是篩選條件）----
 INST_DAYS = 5                       # 記錄近 5 個交易日
@@ -203,6 +207,11 @@ BASELINE_CALL_INTERVAL = 1.15       # 每次歷史行情呼叫的最小間隔（
 BASELINE_MIN_COVERAGE = 0.6         # 成功算出矩陣的檔數 / 候選檔數 低於此值就視為失敗
 BASELINE_MIN_CANDLES_PER_DAY = 30   # 某一天的分 K 少於這個根數，視為該日資料不完整
 BASELINE_MAX_MINUTE = OPEN_TO_CLOSE_MINUTES - 1      # 270 = 13:30 那一根
+
+# ---- 指數代號（v69.2：名稱精確比對，不再用「名稱含某字」；清單順序變動也不會挑錯）----
+INDEX_EXCHANGE = {"tse": "TWSE", "otc": "TPEx"}
+INDEX_EXACT_NAMES = {"tse": ("發行量加權股價指數", "加權股價指數", "加權指數"), "otc": ("櫃買指數",)}
+INDEX_KNOWN_SYMBOL = {"tse": "IX0001", "otc": "IX0043"}      # 名稱對不到時，只有「代號真的在該交易所清單裡」才採用
 
 STATE = {"date": "", "run": {}, "triggered": {}, "a2": {}, "b_confirm": {}, "signals": [], "regime_events": [], "regime": {}}
 PENDING_A1, PENDING_A2, PENDING_BC = {}, {}, {}      # 二次確認待確認池（只存在記憶體）
@@ -594,33 +603,40 @@ class FubonFeed:
         指數清單會印在 log，第一次執行請核對。"""
         if self.index_syms is not None:
             return self.index_syms
-        out, names = {"tse": None, "otc": None}, []
-        try:
-            listed = []                                       # (交易所, 代號, 名稱)
-            for ex in ("TWSE", "TPEx"):
-                try:
-                    with self.lock:
-                        r = self.stock.intraday.tickers(type="INDEX", exchange=ex)
-                    for x in ((r.get("data") if isinstance(r, dict) else None) or []):
-                        listed.append((ex, str(x.get("symbol")), str(x.get("name"))))
-                except Exception as exc2:
-                    print(f"[富邦] 查詢 {ex} 指數清單失敗：{type(exc2).__name__}: {exc2}", flush=True)
-            names = [(s, n) for _, s, n in listed]
-            for ex, sym, nm in listed:
-                if "報酬" in nm:
-                    continue
-                if out["tse"] is None and ex == "TWSE" and "加權" in nm:
-                    out["tse"] = sym
-                if out["otc"] is None and ex == "TPEx" and ("櫃買" in nm or "櫃檯" in nm):
-                    out["otc"] = sym
-            print(f"[富邦] 櫃買(TPEx)指數清單：{[(s, n) for e, s, n in listed if e == 'TPEx']}", flush=True)
-        except Exception as exc:
-            print(f"[富邦] 查詢指數清單失敗：{type(exc).__name__}: {exc}", flush=True)
+        out, names, how = {"tse": None, "otc": None}, [], {}
+        for mk, ex in INDEX_EXCHANGE.items():
+            try:
+                lst = self._index_list(ex)
+            except Exception as exc:
+                print(f"[富邦] 查詢 {ex} 指數清單失敗：{type(exc).__name__}: {exc}", flush=True)
+                lst = []
+            names += lst
+            cands = [(s, n.strip()) for s, n in lst if "報酬" not in n]
+            hit = next(((s, n) for s, n in cands if n in INDEX_EXACT_NAMES[mk]), None)
+            if hit:
+                out[mk], how[mk] = hit[0], f"名稱精確比對「{hit[1]}」"
+            else:
+                known = INDEX_KNOWN_SYMBOL[mk]
+                hit = next(((s, n) for s, n in cands if s == known), None)
+                if hit:
+                    out[mk], how[mk] = hit[0], f"名稱不符，但代號 {known} 在 {ex} 清單內（{hit[1]}）"
         if out["tse"] is None:
-            out["tse"] = "IX0001"
+            out["tse"], how["tse"] = INDEX_KNOWN_SYMBOL["tse"], "清單沒有對到，退回預設代號（未驗證）"
         self.index_syms, self.index_names = out, names
-        print(f"[富邦] 指數代號：加權 = {out['tse']}｜櫃買 = {out['otc']}（指數清單前 30 筆：{names[:30]}）", flush=True)
+        print(f"[富邦] 指數代號：加權 = {out['tse']}（{how.get('tse', '—')}）｜櫃買 = {out['otc']}（{how.get('otc', '沒有對到；上櫃個股暫用加權指數判斷')}）", flush=True)
+        if out["otc"] is None:
+            print(f"[富邦] 櫃買 {INDEX_EXCHANGE['otc']} 清單名稱含「櫃買」的指數：{[(s, n) for s, n in names if '櫃買' in n and '報酬' not in n][:20]}", flush=True)
         return out
+
+    def _index_list(self, exchange: str) -> list:
+        """某交易所的指數清單 [(代號, 名稱)]。SDK 不認得 exchange 參數時，退回不帶參數（清單會混在一起）。"""
+        try:
+            with self.lock:
+                r = self.stock.intraday.tickers(type="INDEX", exchange=exchange)
+        except TypeError:
+            with self.lock:
+                r = self.stock.intraday.tickers(type="INDEX")
+        return [(str(x.get("symbol")), str(x.get("name"))) for x in ((r.get("data") if isinstance(r, dict) else None) or [])]
 
     def index_price(self, market: str):
         """即時指數（lastPrice）。失敗或沒有代號回傳 None。"""
@@ -1433,9 +1449,10 @@ def candle_minute(ts: str):
     return dt.strftime("%Y-%m-%d"), dt.hour * 60 + dt.minute - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE)
 
 
-def day_curves(candles: list, days: list):
+def day_curves(candles: list, days: list, min_candles: int = None):
     """把 1 分 K 依日期整理成 {日期: 長度 MATRIX_POINTS 的累積量 list}：cum[m] = 開盤後第 m 分鐘『開始前』的累積量（張），cum[271] = 全日量。
-    某天分 K 不足 BASELINE_MIN_CANDLES_PER_DAY 根就不放進結果。"""
+    某天分 K 不足 min_candles（預設 BASELINE_MIN_CANDLES_PER_DAY）根就不放進結果。"""
+    min_candles = BASELINE_MIN_CANDLES_PER_DAY if min_candles is None else min_candles
     by_day = {d: [0.0] * (BASELINE_MAX_MINUTE + 1) for d in days}
     counts = {d: 0 for d in days}
     for c in candles:
@@ -1449,7 +1466,7 @@ def day_curves(candles: list, days: list):
             counts[day] += 1
     out = {}
     for d in days:
-        if counts[d] < BASELINE_MIN_CANDLES_PER_DAY:
+        if counts[d] < min_candles:
             continue
         cum = [0.0] * (BASELINE_MAX_MINUTE + 2)
         for i in range(BASELINE_MAX_MINUTE + 1):
@@ -1477,11 +1494,13 @@ def build_entry(curves: dict, days: list):
     return {"r": r, "last": last, "n": len(full)}
 
 
-def blend_r(entries: dict) -> None:
-    """個股佔比與全市場佔比（各分鐘的中位數）以 R_BLEND（70:30）混合，就地修改。"""
+def blend_r(entries: dict, ref=None) -> None:
+    """個股佔比與全市場佔比（各分鐘的中位數）以 R_BLEND（70:30）混合，就地修改。
+    ref = 只用這些代號的曲線算「全市場曲線」（低量股的曲線很零碎，不拿來拉動 A1 候選股的市場曲線）；沒有指定或交集為空 → 用全部。"""
     if not entries:
         return
-    mkt = [_median([e["r"][j] for e in entries.values()]) for j in range(MATRIX_POINTS)]
+    src = [e for c, e in entries.items() if ref is None or c in ref] or list(entries.values())
+    mkt = [_median([e["r"][j] for e in src]) for j in range(MATRIX_POINTS)]
     for e in entries.values():
         e["r"] = [round(R_BLEND[0] * a + R_BLEND[1] * b, 4) for a, b in zip(e["r"], mkt)]
         e["r"][-1] = 1.0
@@ -1495,14 +1514,14 @@ def trading_days(feed, asof: date_cls) -> list:
     return days[-R_DAYS:]
 
 
-def fetch_minute_curves(feed, code: str, days: list, chunk: int):
+def fetch_minute_curves(feed, code: str, days: list, chunk: int, min_candles: int = None):
     """抓 1 分 K 並整理成 {日期: 累積量曲線}；days 依 chunk 分段請求（富邦單次回傳筆數上限沒有文件，所以可調）。"""
     candles = []
     for i in range(0, len(days), chunk):
         seg = days[i:i + chunk]
         feed._hist_pace()
         candles += feed.candles(code, seg[0], seg[-1], timeframe="1")
-    return day_curves(candles, days), len(candles)
+    return day_curves(candles, days, min_candles), len(candles)
 
 
 def check_against_snapshot(feed, entries: dict, asof: str) -> str:
@@ -1529,9 +1548,12 @@ def check_against_snapshot(feed, entries: dict, asof: str) -> str:
     return f"分K加總 / 快照全日量：中位數 {med:.3f}，±2% 內 {near:.0%}（{len(ratios)} 檔）{verdict}"
 
 
-def build_volume_matrix(codes, asof: date_cls, feed):
+def build_volume_matrix(codes, asof: date_cls, feed, lowliq=None):
     """用富邦 1 分 K 為「候選股」預先算好分時累積佔比矩陣。成功回傳 (entries, days, 說明)；失敗（會發 Telegram）回傳 (None, None, 原因)。
-    entries = {代號: {"r": [272 個佔比], "last": 基準日全日量, "n": 完整日數}}；寫檔由呼叫端（baseline.py）一次寫進 initial_pools.json。"""
+    entries = {代號: {"r": [272 個佔比], "last": 基準日全日量, "n": 完整日數}}；寫檔由呼叫端（baseline.py）一次寫進 initial_pools.json。
+    lowliq = 5 日均量 < 1,000 張的候選（B 池全市場）：分 K 完整日門檻降為 B_LOWLIQ_MIN_CANDLES，且不參與「全市場曲線」的計算。
+    回傳的說明字串會註明有幾檔低量股沒算出矩陣（這些股票盤中不會被 B 確認）。"""
+    lowliq = set(lowliq or ())
     started = time.time()
     title = "【分時量矩陣】夜間預計算"
     universe = sorted(codes)
@@ -1550,7 +1572,7 @@ def build_volume_matrix(codes, asof: date_cls, feed):
     entries, skipped, errors, probe = {}, [], 0, []
     for n, code in enumerate(universe, 1):
         try:
-            curves, n_candles = fetch_minute_curves(feed, code, days, chunk)
+            curves, n_candles = fetch_minute_curves(feed, code, days, chunk, B_LOWLIQ_MIN_CANDLES if code in lowliq else None)
         except Exception as exc:
             errors += 1
             skipped.append(code)
@@ -1566,7 +1588,7 @@ def build_volume_matrix(codes, asof: date_cls, feed):
                 entries.clear()
                 skipped.clear()
                 for c2 in universe[:3]:
-                    cv, _ = fetch_minute_curves(feed, c2, days, chunk)
+                    cv, _ = fetch_minute_curves(feed, c2, days, chunk, B_LOWLIQ_MIN_CANDLES if c2 in lowliq else None)
                     e2 = build_entry(cv, days)
                     if e2:
                         entries[c2] = e2
@@ -1587,9 +1609,12 @@ def build_volume_matrix(codes, asof: date_cls, feed):
         return None, None, msg
     check_text = check_against_snapshot(feed, entries, asof.isoformat())
     print(f"[分時量矩陣] {check_text}", flush=True)
-    blend_r(entries)
+    blend_r(entries, ref=set(entries) - lowliq)
     minutes = (time.time() - started) / 60
     skipped_txt = f"｜略過 {len(skipped)} 檔（完整日不足 {R_MIN_DAYS} 天或抓取失敗）" if skipped else ""
+    skipped_low = [c for c in skipped if c in lowliq]
+    if skipped_low:
+        skipped_txt += f"，其中低量股 {len(skipped_low)} 檔（{'、'.join(skipped_low[:8])}{'…' if len(skipped_low) > 8 else ''}）盤中不會被 B 確認"
     note = f"涵蓋 {len(entries)}/{len(universe)} 檔{skipped_txt}｜耗時 {minutes:.1f} 分鐘｜{check_text}"
     print(f"[分時量矩陣] 完成：{note}", flush=True)
     return entries, days, note
@@ -1615,7 +1640,10 @@ def fubon_universe(snap: dict, min_lots: float) -> dict:
 
 
 def pick_universe(snap: dict) -> dict:
-    """預篩（快照全日量 ≥ 5 日均量門檻 × PREFILTER_RATIO）。預篩後太少（例如盤前快照量為 0）→ 改抓全部股票。"""
+    """要抓日 K 的股票範圍。B_FULL_MARKET = True（預設）：全市場（B 池不篩 5 日均量，要全市場確認）。
+    否則預篩（快照全日量 ≥ 5 日均量門檻 × PREFILTER_RATIO）；預篩後太少（例如盤前快照量為 0）→ 改抓全部股票。"""
+    if B_FULL_MARKET:
+        return fubon_universe(snap, 0.0)
     uni = fubon_universe(snap, MIN_VOL5_LOTS * PREFILTER_RATIO)
     if len(uni) < PREFILTER_MIN_UNIVERSE:
         print(f"[歷史資料] 預篩只剩 {len(uni)} 檔（快照可能沒有成交量），改抓全部股票，耗時較長", flush=True)
@@ -1691,7 +1719,7 @@ def make_base(code: str, s: dict, industry: str = "", track=None):
         "liquid": avg5 >= MIN_VOL5_LOTS,
     }
     precompute_static(base)
-    base["b_hit"] = b_scan_last(s) if (B_ENABLED and base["liquid"]) else None
+    base["b_hit"] = b_scan_last(s) if (B_ENABLED and avg5 >= B_MIN_VOL5_LOTS) else None      # B 不看 liquid（5 日均量 1,000 張）；B_MIN_VOL5_LOTS = 0 → 全市場
     if track is not None:
         base["a2"] = consolidation_run(s["dates"], s["c"], s["v"], track[0], track[1])
     return base
@@ -2020,8 +2048,8 @@ def merge_b_candidates(pools: dict, bases: dict) -> dict:
     added = skipped = 0
     for code, base in sorted(bases.items()):
         h = base.get("b_hit")
-        if not h or not base["liquid"] or base["market"] in UNRELIABLE_MARKETS:
-            continue
+        if not h or base["avg_5d_vol_simple"] < B_MIN_VOL5_LOTS or base["market"] in UNRELIABLE_MARKETS:
+            continue                                         # B 不篩 1,000 張流動性（全市場），只看 B_MIN_VOL5_LOTS（預設 0）
         if code in pools["b"] or (code, h["burst_date"]) in done:
             skipped += 1
             continue
@@ -2379,7 +2407,7 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
     sections.append(["📋 <b>規則摘要</b>",
                     f"🟢 A1：昨收 ≤ 昨日最高均線 → 今日同時站上即時 MA5/10/20 ＋ 漲幅 > {A1_CHG_MIN:g}% ＋ 紅 K ＋ 現價 > VWAP ＋ 同期量比 ≥ {A1_VOL_RATIO:g}（BEAR {A1_VOL_RATIO_BEAR:g}）＋ 預估量 ≥ {A1_MIN_EST_LOTS:,} 張 ＋ 預估金額 ≥ {A_MIN_EST_TURNOVER / 1e8:g} 億",
                     f"🟡 A2：A1 收盤確認後 {A_TRACK_DAYS} 日內，拉回整理 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天 → 現價 > 即時 MA5 與 VWAP ＋ 預估量 ≥ 整理期均量 × {A2_VOL_RATIO:g} ＋ 預估金額 ≥ {A_MIN_EST_TURNOVER / 1e8:g} 億（BEAR 禁止）",
-                    f"🔵 B：KD 低檔金叉＋爆量≥{B_VOL_RATIO:g}x＋收盤位置≥{B_CLOSE_LOC_MIN * 100:.0f}% → 10:00 起確認（最低未破＋量縮≤{B_SHRINK_RATIO:g}x＋站上 MA5/VWAP＋預估金額≥{B_MIN_EST_TURNOVER / 1e8:g} 億），等待最多 {B_WAIT_DAYS} 日",
+                    f"🔵 B（全市場，不篩 5 日均量）：KD 低檔金叉＋爆量≥{B_VOL_RATIO:g}x＋收盤位置≥{B_CLOSE_LOC_MIN * 100:.0f}% → 10:00 起確認（最低未破＋量縮≤{B_SHRINK_RATIO:g}x＋站上 MA5/VWAP＋預估金額≥{B_MIN_EST_TURNOVER / 1e8:g} 億），等待最多 {B_WAIT_DAYS} 日",
                     f"趨勢：指數 ≥ 即時月線 = NORMAL；連續 {REGIME_ENTER_BEAR_ROUNDS} 輪低於 → BEAR；站回並維持 {REGIME_EXIT_HOLD_SEC // 60} 分鐘 → NORMAL（正式切換才通知）",
                     "判斷時段 09:05～13:24:45｜連續 2 輪符合才通知｜同一檔同一天只發一種主訊號｜停損由你自己處理"])
     if notes:
@@ -2581,8 +2609,9 @@ def process_poll(snap: dict, ctx: dict, regime, now: datetime, funnel: dict):
         row, base, table = snap["rows"].get(code), bases.get(code), matrix.get(code)
         if row is None or base is None or table is None:
             continue
-        if not base["liquid"] or base["market"] in UNRELIABLE_MARKETS:
+        if base["market"] in UNRELIABLE_MARKETS:
             continue
+        liquid = base["liquid"]                  # 5 日均量 ≥ 1,000 張：只限制 A1、A2；B 全市場確認，不看這個
         mkt = row["_mkt"]
         mode = regime.mode(mkt) if regime is not None else "NORMAL"
         x = xs.get(mkt, minutes_since_open(now))
@@ -2592,12 +2621,12 @@ def process_poll(snap: dict, ctx: dict, regime, now: datetime, funnel: dict):
             continue
         done = False
         a_entry = pools["a"].get(code)
-        if A2_ENABLED and a_entry and code not in STATE["a2"]:
+        if A2_ENABLED and a_entry and liquid and code not in STATE["a2"]:
             sig = evaluate_a2(a_entry, base, table, row, x, mode)
             if sig:
                 a2c.append(sig)
                 done = True
-        if A1_ENABLED and code in a1_set and code not in STATE["triggered"] and not (done and ONE_SIGNAL_PER_STOCK):
+        if A1_ENABLED and liquid and code in a1_set and code not in STATE["triggered"] and not (done and ONE_SIGNAL_PER_STOCK):
             sig = evaluate_a1(base, table, row, x, mode, funnel)
             if sig:
                 a1c.append(sig)
