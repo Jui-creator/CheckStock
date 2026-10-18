@@ -1,4 +1,4 @@
-"""飆股雷達 v69：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構：APP SCRIPT 雙 Workflow＋分時量矩陣預計算」最終版）。
+"""飆股雷達 v69.3：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構：APP SCRIPT 雙 Workflow＋分時量矩陣預計算」最終版）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 
 【觸發方式】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
@@ -8,7 +8,8 @@
   13:25 後才啟動只做收盤結算。同一交易日 stock_states.json 已標 COMPLETED 時，重複觸發直接忽略。
 
 【市場趨勢：只有 NORMAL / BEAR 兩態（上市用加權、上櫃用櫃買，各自獨立）】
-  即時月線 MA20 =（前 19 個完整交易日指數收盤 + 盤中即時指數）/ 20；指數 ≥ MA20 ⇔ 指數 ≥ P（P = 前 19 日收盤平均，夜間算好存進 initial_pools.json）。
+  即時月線 MA20 =（前 19 個完整交易日指數收盤 + 盤中即時指數）/ 20：前 19 日收盤夜間算好存進 initial_pools.json（closes19），盤中每 15 秒用最新指數明確算出即時 MA20 再比較；
+  （數學上等價於 指數 ≥ 穿越價 P = 前 19 日收盤平均；P 只用來顯示與驗算。）
   NORMAL：A1 預估量 ≥ 5 日均量 × 1.5（搭配同期量比）、A2 開放、B 開放。
   BEAR  ：A1 預估量 ≥ 5 日均量 × 2.0（搭配同期量比）、A2 禁止、B 開放。
   切換防抖：NORMAL→BEAR 連續 2 輪低於即時月線；BEAR→NORMAL 站回即時月線並連續維持 5 分鐘；正式切換才 Telegram 通知一次。
@@ -24,7 +25,7 @@
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：昨收 ≤ 昨日最高均線；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
-  A2：僅追蹤池內；曾收盤跌破 MA5 但守住 MA10 與突破日低點，整理第 2~6 天；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；
+  A2：僅追蹤池內；曾收盤跌破 MA5 但守住 MA10 與突破日低點，整理 1~6 天（連續 1~6 個交易日收盤 < MA5、守住 MA10 與突破日低點；只跌破 1 天、今天就站回也算）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；
       預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 2 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
@@ -121,7 +122,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v69.2"
+RADAR_VERSION = "v69.3"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -1018,7 +1019,7 @@ def consolidation_run(dates, closes, vols_lots, after_date, floor_low=None):
 
 
 def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
-    """A2：整理期 2～6 天；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日金額 ≥ 30 億。只在 NORMAL 發。"""
+    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日金額 ≥ 30 億。只在 NORMAL 發。"""
     if mode != "NORMAL" or not a2 or not a2.get("n") or not a2.get("avg_vol"):
         return "none"
     if not (A2_MIN_DAYS <= a2["n"] <= A2_MAX_DAYS):
@@ -1096,20 +1097,34 @@ def b_confirm_stage(day_low, est, burst_low, burst_vol, price, ma5, vwap):
 # 市場趨勢（只有 NORMAL / BEAR；上市、上櫃各自獨立）
 # =========================
 def p_ma20(prior_closes):
-    """即時月線穿越價 P = 前 19 日收盤平均。盤中即時 MA20 = (19 日收盤 + 即時指數) / 20；指數 ≥ MA20 ⇔ 指數 ≥ P。資料不足回傳 None。"""
+    """前 19 個完整交易日收盤平均 P（= 盤中指數剛好等於即時 MA20 的「穿越價」，只用來顯示與驗算）。
+    盤中判斷不直接用 P，而是每輪用 IndexWatch.ma20() 明確算出即時 MA20 =（前 19 日收盤合計 + 即時指數）/ 20 再比較（數學上等價於 指數 ≥ P）。資料不足回傳 None。"""
     return sum(prior_closes[-19:]) / 19.0 if len(prior_closes) >= 19 else None
 
 
 class IndexWatch:
-    """單一指數的趨勢狀態機。NORMAL → BEAR：連續 REGIME_ENTER_BEAR_ROUNDS 輪低於即時月線；
-    BEAR → NORMAL：站回即時月線（≥ P）並連續維持 REGIME_EXIT_HOLD_SEC 秒，期間任何一輪再跌回月線下方，計時歸零。讀不到指數的那一輪視為無法確認（計數歸零）。"""
+    """單一指數的趨勢狀態機（v69.3：盤中每 15 秒明確計算即時 MA20）。
+    即時 MA20 =（前 19 個完整交易日指數收盤合計 sum19 + 本輪即時指數）/ 20；指數 < 即時 MA20 → 在月線下方。
+    NORMAL → BEAR：連續 REGIME_ENTER_BEAR_ROUNDS 輪低於即時 MA20；
+    BEAR → NORMAL：站回即時 MA20（≥）並連續維持 REGIME_EXIT_HOLD_SEC 秒，期間任何一輪再跌回月線下方，計時歸零。讀不到指數的那一輪視為無法確認（計數歸零）。
+    sum19 來自夜間存進 initial_pools.json 的 closes19；舊檔沒有 closes19 時，用 p × 19 還原。"""
 
-    def __init__(self, name: str, p: float, state: str = "NORMAL", last_close: float = None):
-        self.name, self.p, self.state, self.last_close = name, p, state, last_close
+    def __init__(self, name: str, p: float, state: str = "NORMAL", last_close: float = None, closes19=None):
+        if closes19 and len(closes19) >= 19:
+            self.sum19 = float(sum(closes19[-19:]))
+        else:
+            self.sum19 = float(p) * 19.0
+        self.name, self.state, self.last_close = name, state, last_close
+        self.p = self.sum19 / 19.0                  # 穿越價（只用來顯示與驗算）
         self.below_rounds = 0
         self.above_since = None
         self.last_reading = None
+        self.last_ma20 = None
         self.switches = 0
+
+    def ma20(self, reading: float) -> float:
+        """即時 MA20 =（前 19 個完整交易日收盤合計 + 即時指數）/ 20。"""
+        return (self.sum19 + reading) / 20.0
 
     def update(self, reading, now_sec: float):
         """每輪餵入即時指數與時間（秒）。回傳 'TO_BEAR'（本輪正式轉空頭）/ 'TO_NORMAL'（本輪正式恢復多頭）/ None。"""
@@ -1118,7 +1133,8 @@ class IndexWatch:
             self.above_since = None
             return None
         self.last_reading = reading
-        below = reading < self.p
+        self.last_ma20 = self.ma20(reading)
+        below = reading < self.last_ma20
         if self.state == "NORMAL":
             self.above_since = None
             if below:
@@ -1162,7 +1178,8 @@ def build_regime(ctx: dict, saved: dict = None) -> Regime:
         if not p:
             continue
         state = ((saved or {}).get(mk) or {}).get("state") or c.get("init_state") or "NORMAL"
-        watches[mk] = IndexWatch(c.get("name", mk), float(p), state if state in ("NORMAL", "BEAR") else "NORMAL", c.get("last_close"))
+        watches[mk] = IndexWatch(c.get("name", mk), float(p), state if state in ("NORMAL", "BEAR") else "NORMAL", c.get("last_close"),
+                                 c.get("closes19"))
     return Regime(watches)
 
 
@@ -2034,11 +2051,29 @@ def index_regime_snapshot(feed, asof: date_cls) -> dict:
         if len(hist) < 19:
             print(f"[指數] {label} 歷史不足 19 日（{len(hist)}），略過", flush=True)
             continue
-        closes = [float(v) for _, v in hist][-19:]
-        p = sum(closes) / 19.0
+        all_c = [float(v) for _, v in hist]
+        closes = all_c[-19:]
+        dates19 = [d.isoformat() for d, _ in hist][-19:]
+        sum19 = sum(closes)
+        p = sum19 / 19.0
+        ma20_flat = (sum19 + closes[-1]) / 20.0               # 明天開盤若持平於昨收，盤中即時 MA20 的起點
+        ma20_asof, dropped = None, None
+        if len(all_c) >= 20:                                   # 看盤軟體在基準日當天看到的 MA20 = 含基準日在內的最近 20 個收盤平均
+            ma20_asof = sum(all_c[-20:]) / 20.0
+            dropped = (hist[-20][0].isoformat(), all_c[-20])  # 隔天的 19 日窗口會丟掉的那一天
+        print(f"[指數] {label} 前 19 日收盤（{dates19[0]} ～ {dates19[-1]}）："
+              + "、".join(f"{d[5:]} {v:,.2f}" for d, v in zip(dates19, closes)), flush=True)
+        print(f"[指數] {label} 驗算：前 19 日合計 {sum19:,.2f}｜穿越價 P = 合計/19 = {p:,.2f}｜昨收 {closes[-1]:,.2f}｜"
+              f"明天開盤持平的即時 MA20 = (合計 + 昨收)/20 = {ma20_flat:,.2f}", flush=True)
+        if ma20_asof is not None:
+            print(f"[指數] {label} 與看盤軟體對帳：{dates19[-1]} 當天 MA20（含當天的最近 20 日）應為 {ma20_asof:,.2f}"
+                  f"（比 19 日窗口多一天：{dropped[0]} 收盤 {dropped[1]:,.2f}，隔天的窗口會把它丟掉）", flush=True)
         out[mk] = {"name": label, "symbol": syms[mk], "last_date": hist[-1][0].isoformat(), "stale": hist[-1][0] != asof,
-                   "closes19": [round(v, 2) for v in closes], "p": round(p, 4), "last_close": closes[-1],
-                   "init_state": "NORMAL" if closes[-1] >= p else "BEAR"}
+                   "closes19": [round(v, 2) for v in closes], "closes19_dates": dates19, "sum19": round(sum19, 2), "p": round(p, 4),
+                   "last_close": closes[-1], "ma20_flat": round(ma20_flat, 2),
+                   "ma20_asof": None if ma20_asof is None else round(ma20_asof, 2),
+                   "dropped_date": None if dropped is None else dropped[0], "dropped_close": None if dropped is None else round(dropped[1], 2),
+                   "init_state": "NORMAL" if closes[-1] >= ma20_flat else "BEAR"}
     return out
 
 
@@ -2285,11 +2320,12 @@ def build_regime_message(ev: str, w, now: datetime) -> str:
     """市場趨勢「正式切換」才發（防抖確認期間不發）；一個市場一則。"""
     t_now = now.strftime("%H:%M:%S")
     cur = f"{w.last_reading:,.2f}" if w.last_reading is not None else "—"
+    ma = f"{w.last_ma20:,.2f}" if w.last_ma20 is not None else "—"
     if ev == "TO_BEAR":
         return (f"🔴 <b>【市場趨勢：空頭 BEAR】</b> {t_now}\n{w.name} 連續 {REGIME_ENTER_BEAR_ROUNDS} 輪低於盤中即時月線"
-                f"（月線穿越價 {w.p:,.2f}，現 {cur}）\nA1 同期量比門檻提高為 {A1_VOL_RATIO_BEAR:g} 倍｜A2 禁止｜B 照常（{w.name} 對應的{'上市' if w.name == '加權' else '上櫃'}個股）")
+                f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 同期量比門檻提高為 {A1_VOL_RATIO_BEAR:g} 倍｜A2 禁止｜B 照常（{w.name} 對應的{'上市' if w.name == '加權' else '上櫃'}個股）")
     return (f"🟢 <b>【市場趨勢：多頭 NORMAL】</b> {t_now}\n{w.name} 站回盤中即時月線並連續維持 {REGIME_EXIT_HOLD_SEC // 60} 分鐘"
-            f"（月線穿越價 {w.p:,.2f}，現 {cur}）\nA1 門檻回到 {A1_VOL_RATIO:g} 倍｜A2 恢復開放｜B 照常")
+            f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 門檻回到 {A1_VOL_RATIO:g} 倍｜A2 恢復開放｜B 照常")
 
 
 # ---------- 盤後 ----------
@@ -2378,8 +2414,13 @@ def regime_lines(regime, compact: bool = False) -> list:
             out.append(f"🌡️ {w.name}：{icon}｜正式切換 {w.switches} 次")
         else:
             lc = f"｜昨收 {w.last_close:,.0f}" if w.last_close else ""
-            cur = f"｜現 {w.last_reading:,.0f}" if w.last_reading is not None else ""
-            out.append(f"🌡️ {w.name}：<b>{icon}</b>｜即時月線穿越價 P {w.p:,.0f}{lc}{cur}")
+            if w.last_reading is not None:
+                ma_txt = f"｜現 {w.last_reading:,.0f}｜即時 MA20 {w.ma20(w.last_reading):,.0f}"
+            elif w.last_close:
+                ma_txt = f"｜即時 MA20（以昨收估）{w.ma20(w.last_close):,.0f}"
+            else:
+                ma_txt = ""
+            out.append(f"🌡️ {w.name}：<b>{icon}</b>{lc}{ma_txt}｜穿越價 {w.p:,.0f}")
     if "otc" not in regime.w and not compact:
         out.append("ℹ️ 沒有櫃買指數基準，上櫃個股暫用加權指數判斷")
     return out
@@ -2877,11 +2918,12 @@ async def main_async() -> None:
     readings, check_note = await self_check(feed, loop)
     for mk, w in regime.w.items():
         if mk not in STATE["regime"] and readings.get(mk) is not None:                     # 今天第一次啟動：用目前讀數決定起始狀態
-            w.state = "NORMAL" if readings[mk] >= w.p else "BEAR"
             w.last_reading = readings[mk]
+            w.last_ma20 = w.ma20(readings[mk])
+            w.state = "NORMAL" if readings[mk] >= w.last_ma20 else "BEAR"
     STATE["regime"] = {mk: {"state": w.state, "p": w.p} for mk, w in regime.w.items()}
     save_states()
-    print(f"[趨勢] {[(mk, w.name, round(w.p, 2), w.state) for mk, w in regime.w.items()]}", flush=True)
+    print(f"[趨勢] {[(mk, w.name, '前19日合計', round(w.sum19, 2), '穿越價', round(w.p, 2), w.state) for mk, w in regime.w.items()]}", flush=True)
     late = current >= _market_open_today(current) + timedelta(minutes=EVAL_START_MINUTE)
     notes = []
     if STATE["triggered"] or STATE["a2"] or STATE["b_confirm"]:
@@ -3015,8 +3057,10 @@ async def main_async() -> None:
             await flush_alerts(loop)
             polls += 1
             elapsed = time.time() - started
+            trend_txt = "｜".join(f"{w.name} {w.state} 現 {w.last_reading:,.2f} / 即時MA20 {w.last_ma20:,.2f}"
+                                  for w in regime.w.values() if w.last_reading is not None and w.last_ma20 is not None)
             print(f"[{current.strftime('%H:%M:%S')}] 第 {polls} 輪：快照 {len(snap['rows'])} 檔，新訊號/事件 {sent}，今日累計 {len(STATE['signals'])}，"
-                  f"耗時 {elapsed:.2f}s｜{summary}（{delta:+,.0f}）", flush=True)
+                  f"耗時 {elapsed:.2f}s｜{summary}（{delta:+,.0f}）" + (f"｜趨勢 {trend_txt}" if trend_txt else ""), flush=True)
             if polls % 4 == 1:
                 print(f"    樣本 {sample_line(snap)}｜趨勢 {[(w.name, w.state) for w in regime.w.values()]}", flush=True)
             if polls % 20 == 0:
