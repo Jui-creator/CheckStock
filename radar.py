@@ -27,7 +27,7 @@
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
   A2：僅追蹤池內；曾收盤跌破 MA5 但守住 MA10 與突破日低點，整理 1~6 天（連續 1~6 個交易日收盤 < MA5、守住 MA10 與突破日低點；只跌破 1 天、今天就站回也算）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；
       預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
-  B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 2 億；NORMAL / BEAR 都發。
+  B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
 【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → A1_CLOSE_CONFIRMED 進 A2 追蹤池；A2 收盤跌破 MA10 或突破日低點移出、滿 10 日移出；
   B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出（不發停損／出場通知）；寫 signal_history.json、pool_report.csv。
@@ -169,7 +169,7 @@ B_WAIT_DAYS = 5                     # B 訊號後第 5 個交易日收盤仍未�
 B_ACTIVE_TRACK_DAYS = 5             # 發動（確認通知）後再追蹤幾個交易日（只管清單）
 B_CONFIRM_START_MINUTE = 60         # 10:00 起才判斷
 B_SHRINK_RATIO = 0.6                # 預估全日量 ≤ B 訊號日量 × 0.6
-B_MIN_EST_TURNOVER = 200_000_000    # 預估全日成交金額 ≥ 2 億
+B_MIN_EST_TURNOVER = 500_000_000    # 預估全日成交金額 ≥ 5 億
 B_REQUIRE_MA5 = True                # 現價 > 即時 MA5
 B_REQUIRE_VWAP = True               # 現價 > 即時 VWAP（確認強度）
 B_STATUS_MISS_DAYS = 3              # 連續幾天抓不到收盤資料 → 資料缺失移出
