@@ -1,4 +1,4 @@
-"""夜間運算 baseline.py（v69.3）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
+"""夜間運算 baseline.py（v69.4）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
 價格與成交量全部來自富邦 Neo API；法人用官方資料（外資＋投信，只當參考）。建議 18:00 之後由 Google Apps Script 呼叫 baseline.yml（workflow_dispatch）觸發。
 流程：
   0. 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json → 直接結束（要強制重跑：workflow 手動執行時勾選 force，或環境變數 FORCE=1）
@@ -7,14 +7,16 @@
   2. 核對 / 補結算：radar 13:35 已結算 → 用官方日 K 核對當日 A1 收盤確認（close_provisional → official_reconciled）；
                     radar 當天沒結算成功 → 這裡用官方日 K 補結算（A1 收盤確認 / A2 移出 / B 等待日數與到期）
   3. B 池：全市場掃描 KD 低檔金叉＋爆量＋收盤位置，通過者併入 B 池（等待最多 5 個交易日）；不篩 5 日均量
-  4. 候選池：A1 候選池（5 日均量 >= 1,000 張 ＋ 昨收 <= 昨日最高均線）、A2 追蹤池（收盤確認的 A1，10 個交易日內）、B 候選池（全市場）
+  4. 候選池：A1 候選池（5 日均量 >= 1,000 張 ＋ 昨收 <= 昨日最高均線）、B 候選池（全市場）
+     A1 追蹤 / A2 池（v69.4 分開）：A1 收盤確認後 10 個交易日內先在「A1 追蹤」；用日 K 重算連續拉回整理天數（收盤 < MA5、守住 MA10 與突破日低點），
+     1～6 天 → 進「A2 池」（盤中重新站回才觸發 A2）；沒拉回或拉回超過 6 天 → 仍在 A1 追蹤（不會觸發 A2）
   5. 分時量矩陣：只替候選股（A1 候選 ＋ A2 追蹤池 ＋ B 池）抓 1 分 K，預先算好「開盤後每分鐘的歷史同期累積佔比」→ volume_time_matrix
      低量 B 候選（5 日均量 < 1,000 張）分 K 完整日門檻放寬，且不參與全市場曲線；仍算不出矩陣的會在 Telegram 列出（盤中不會被 B 確認）
   6. 官方法人（證交所 T86 ＋ 櫃買）近 5 日；只記錄、不篩選。櫃買表頭沒有法人名稱 → 依固定位置解析並用「三大法人合計」驗算
   7. 加權、櫃買指數最近 19 個完整交易日收盤（存 closes19 / sum19，隔天盤中每 15 秒明確算即時 MA20）；指數代號用名稱精確比對（radar.py v69.2 起）
      v69.3：log 會印出前 19 日收盤明細、合計、穿越價 P，以及「看盤軟體基準日當天 MA20」供對帳（比 19 日窗口多含一天）
   8. 原子寫入 initial_pools.json（暫存檔 → fsync → os.replace），再存 signal_history.json。任何一步資料不完整 → 不覆寫前一版 initial_pools.json
-需要同資料夾的 radar.py（v69.3：夜間／盤中共用函式都在那裡）。
+需要同資料夾的 radar.py（v69.4：夜間／盤中共用函式都在那裡）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
@@ -136,7 +138,7 @@ def already_done(feed):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("夜間運算 baseline.py v69.3（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
+    print("夜間運算 baseline.py v69.4（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
     print("=" * 55, flush=True)
     if not rd.B_FULL_MARKET:
         print("⚠️ rd.B_FULL_MARKET = False：夜間日 K 只抓快照成交量預篩後的股票，B 池不是全市場", flush=True)
@@ -203,6 +205,12 @@ def main() -> int:
                        f"A2 追蹤池移出 {len(res['a_exits'])} 檔，B 池移出 {len(res['b_exits'])} 檔")
     print(f"[結算] {settle_note}", flush=True)
 
+    # ---- A1 追蹤 / A2 池：用日 K 重算每檔追蹤標的的連續拉回整理天數，決定誰在「A1 追蹤」、誰進「A2 池」----
+    stage_cnt = rd.apply_a_stages(pools, bases)
+    print(f"[A 追蹤] A1 追蹤（收盤確認後還沒拉回）{stage_cnt['a1']} 檔｜A2 池（拉回整理 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天）{stage_cnt['a2']} 檔", flush=True)
+    for cd, e in sorted(pools["a"].items()):
+        print(f"    {cd} {e.get('name', '')}｜{e.get('stage')}｜A1 確認 {e.get('entry_date')}｜連續拉回 {e.get('pullback_days', 0)} 天", flush=True)
+
     # ---- B 池（夜間全市場掃描）----
     merge = rd.merge_b_candidates(pools, bases)
     print(f"[B 池] 夜間新增 {merge['added']} 檔、略過 {merge['skipped']} 檔（已在池中或同一訊號日已移出）", flush=True)
@@ -212,7 +220,7 @@ def main() -> int:
     candidate_codes = set(a1_codes) | set(pools["a"]) | set(pools["b"])
     matrix_codes = sorted(c for c in candidate_codes if c in bases)
     lowliq = {c for c in matrix_codes if not bases[c]["liquid"]}
-    print(f"[候選池] A1 候選 {len(a1_codes)} 檔、A2 追蹤池 {len(pools['a'])} 檔、B 池 {len(pools['b'])} 檔 → 分時量矩陣 {len(matrix_codes)} 檔"
+    print(f"[候選池] A1 候選 {len(a1_codes)} 檔、A1 追蹤＋A2 池 {len(pools['a'])} 檔、B 池 {len(pools['b'])} 檔 → 分時量矩陣 {len(matrix_codes)} 檔"
           f"（其中低量股 {len(lowliq)} 檔，分 K 完整日門檻放寬為 {rd.B_LOWLIQ_MIN_CANDLES} 根）", flush=True)
     matrix, matrix_days, matrix_note = rd.build_volume_matrix(matrix_codes, asof, feed, lowliq)
     if matrix is None:
@@ -253,15 +261,15 @@ def main() -> int:
     rd.save_pools(pools)
 
     meta, c = init["metadata"], init["metadata"]["counts"]
-    n_a2 = sum(1 for e in init["A2_tracking_pool"].values() if rd.A2_MIN_DAYS <= ((e.get("a2") or {}).get("n") or 0) <= rd.A2_MAX_DAYS)
     nw = sum(1 for e in init["B_candidates"].values() if e.get("status") == "Watching")
     b_codes = sorted(init["B_candidates"])
     n_b_low = sum(1 for cd in b_codes if cd in bases and not bases[cd]["liquid"])
     b_nomx = [cd for cd in b_codes if cd not in init["volume_time_matrix"]]
-    lines = [f"📦 <b>【夜間運算 v69.3】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
+    lines = [f"📦 <b>【夜間運算 v69.4】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
              f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜達標（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔",
              f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
-             f"🟢 A2 追蹤池 {c['a2']} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內），其中拉回整理 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天 {n_a2} 檔",
+             f"🟢 A1 追蹤 {c.get('a1_track', 0)} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內，還沒拉回，不會觸發 A2）",
+             f"🟡 A2 池 {c['a2']} 檔（拉回整理 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天，明天盤中重新站回才觸發 A2）",
              f"🔵 B 池 {c['b']} 檔（全市場，不篩 5 日均量；Watching {nw}｜今晚新增 {merge['added']}｜其中 5 日均量 < {rd.MIN_VOL5_LOTS:,} 張 {n_b_low} 檔）",
              f"📊 分時量矩陣 {c['matrix']} 檔（{matrix_note}）",
              f"法人 T 日：上市 {'✅' if inst_meta['tse_ok'] else '❌'} 上櫃 {'✅' if inst_meta['otc_ok'] else '❌'}"
