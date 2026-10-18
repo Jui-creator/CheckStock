@@ -1,4 +1,4 @@
-"""夜間運算 baseline.py（v69.4）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
+"""夜間運算 baseline.py（v69.5）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
 價格與成交量全部來自富邦 Neo API；法人用官方資料（外資＋投信，只當參考）。建議 18:00 之後由 Google Apps Script 呼叫 baseline.yml（workflow_dispatch）觸發。
 流程：
   0. 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json → 直接結束（要強制重跑：workflow 手動執行時勾選 force，或環境變數 FORCE=1）
@@ -10,13 +10,18 @@
   4. 候選池：A1 候選池（5 日均量 >= 1,000 張 ＋ 昨收 <= 昨日最高均線）、B 候選池（全市場）
      A1 追蹤 / A2 池（v69.4 分開）：A1 收盤確認後 10 個交易日內先在「A1 追蹤」；用日 K 重算連續拉回整理天數（收盤 < MA5、守住 MA10 與突破日低點），
      1～6 天 → 進「A2 池」（盤中重新站回才觸發 A2）；沒拉回或拉回超過 6 天 → 仍在 A1 追蹤（不會觸發 A2）
-  5. 分時量矩陣：只替候選股（A1 候選 ＋ A2 追蹤池 ＋ B 池）抓 1 分 K，預先算好「開盤後每分鐘的歷史同期累積佔比」→ volume_time_matrix
+  5. 分時量矩陣：只替候選股（A1 候選 ＋ A1 追蹤 ＋ A2 池 ＋ B 池）抓 1 分 K，預先算好「開盤後每分鐘的歷史同期累積佔比」→ volume_time_matrix
      低量 B 候選（5 日均量 < 1,000 張）分 K 完整日門檻放寬，且不參與全市場曲線；仍算不出矩陣的會在 Telegram 列出（盤中不會被 B 確認）
   6. 官方法人（證交所 T86 ＋ 櫃買）近 5 日；只記錄、不篩選。櫃買表頭沒有法人名稱 → 依固定位置解析並用「三大法人合計」驗算
   7. 加權、櫃買指數最近 19 個完整交易日收盤（存 closes19 / sum19，隔天盤中每 15 秒明確算即時 MA20）；指數代號用名稱精確比對（radar.py v69.2 起）
      v69.3：log 會印出前 19 日收盤明細、合計、穿越價 P，以及「看盤軟體基準日當天 MA20」供對帳（比 19 日窗口多含一天）
   8. 原子寫入 initial_pools.json（暫存檔 → fsync → os.replace），再存 signal_history.json。任何一步資料不完整 → 不覆寫前一版 initial_pools.json
-需要同資料夾的 radar.py（v69.4：夜間／盤中共用函式都在那裡）。
+  9. Telegram 兩則（v69.5）：
+     第 1 則 = 夜間運算摘要（各池檔數、矩陣、法人、指數基準）
+     第 2 則 = 【A2 池 / B 池明細】：逐檔列出明天要盯的標的與「明天盤中觸發 / 確認需要達到的價位與量能」
+        A2 池：拉回第幾天、A1 確認日與價、突破日低點、明天現價需站上多少才算站上即時 MA5、整理期均量與預估量門檻
+        B 池：明天是等待期第幾天（最多 5 天）、B 訊號日防線、昨收距防線 %、KD、爆量倍數、明天確認需要的條件（含量縮上限）、有沒有分時量矩陣
+需要同資料夾的 radar.py（v69.4：夜間／盤中共用函式都在那裡；本檔只用到 radar.py 已有的函式與常數）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
@@ -112,6 +117,106 @@ rd.fetch_inst_days = _fetch_inst_days_v2
 
 
 # =========================
+# 第 2 則 Telegram：A2 池 / B 池明細（v69.5）
+# =========================
+POOL_DETAIL_MAX = 25                  # 每個池最多列幾檔，其餘用「…另有 N 檔」帶過（完整名單在 initial_pools.json）
+_MKT_LABEL = {"tse": "上市", "otc": "上櫃"}
+
+
+def _regime_note(index_ctx) -> list:
+    """明天起始趨勢提醒：BEAR 時 A2 禁止，要等指數站回即時 MA20 並維持 5 分鐘才會恢復。"""
+    if not index_ctx:
+        return ["ℹ️ 沒有取得指數基準，明天起始趨勢由盤前 radar 判定"]
+    bear = [v.get("name", mk) for mk, v in index_ctx.items() if v.get("init_state") == "BEAR"]
+    if not bear:
+        return ["🌡️ 明天起始趨勢：加權／櫃買皆在月線上方（NORMAL），A2 開放"]
+    return [f"🌡️ 明天起始趨勢：{'、'.join(bear)} 在月線下方（BEAR）。BEAR 時 A2 禁止、A1 量能門檻提高為 {rd.A1_VOL_RATIO_BEAR:g} 倍、B 照常；"
+            f"要等指數站回即時 MA20 並連續維持 {rd.REGIME_EXIT_HOLD_SEC // 60} 分鐘才恢復 A2（實際起始狀態由明早盤前讀數決定）"]
+
+
+def build_pool_detail_message(init: dict, bases: dict, pools: dict, asof_str: str, index_ctx) -> str:
+    """【A2 池 / B 池明細】。資料來自剛寫好的 initial_pools.json（init）：A2_tracking_pool、B_candidates、volume_time_matrix；
+    均線、昨收、5 日均量等基底用 bases（取不到再退回 init['stock_bases']）。
+    「站上即時 MA5」的條件：即時 MA5 = (前 4 日收盤合計 + 現價) / 5，所以現價 > 即時 MA5 ⇔ 現價 > 前 4 日收盤平均（ma5_cut）。"""
+    meta = init["metadata"]
+    sb = init.get("stock_bases") or {}
+    matrix = init.get("volume_time_matrix") or {}
+
+    def base_of(code):
+        return bases.get(code) or sb.get(code) or {}
+
+    lines = [f"📋 <b>【A2 池 / B 池明細】</b>基準日 {asof_str}｜下一個交易日 {meta.get('trade_date')}"]
+    lines += _regime_note(index_ctx)
+
+    # ---------- A2 池 ----------
+    a2 = init.get("A2_tracking_pool") or {}
+    lines += ["", f"🟡 <b>【A2 池】{len(a2)} 檔</b>（A1 收盤確認後，某天收盤 < MA5、守住 MA10 與突破日低點，連續 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天；"
+                  f"明天盤中重新站回才觸發 A2）"]
+    if not a2:
+        lines.append("目前沒有標的。")
+    items = sorted(a2.items(), key=lambda kv: (-int(kv[1].get("pullback_days") or 0), kv[0]))
+    for code, e in items[:POOL_DETAIL_MAX]:
+        b = base_of(code)
+        n = int(e.get("pullback_days") or (e.get("a2") or {}).get("n") or rd.entry_pullback_days(e) or 0)
+        avg_vol = (e.get("a2") or {}).get("avg_vol")
+        need = f"現價 > {rd._p2(b.get('ma5_cut'))}"
+        if rd.A2_REQUIRE_ALL_MAS:
+            need += f"、> {rd._p2(b.get('ma10_cut'))}（MA10）、> {rd._p2(b.get('ma20_cut'))}（MA20）"
+        warn = "" if code in matrix else "｜⚠️ 沒有分時量矩陣，盤中無法觸發"
+        vol_txt = (f"預估全日量 ≥ {avg_vol * rd.A2_VOL_RATIO:,.0f} 張（整理期均量 {avg_vol:,.0f} × {rd.A2_VOL_RATIO:g}）"
+                   if avg_vol else "整理期均量不明")
+        lines += ["",
+                  f"<b>{code} {e.get('name', code)}</b>（{_MKT_LABEL.get(e.get('market'), '')}）｜📉 拉回第 {n} 天｜"
+                  f"A1 {rd._md(e.get('entry_date'))} @ {rd._p2(e.get('entry_price'))}{warn}",
+                  f"   昨收 {rd._p2(b.get('yest_close'))}｜MA5 {rd._p2(b.get('true_ma5'))}｜MA10 {rd._p2(b.get('true_ma10'))}｜"
+                  f"突破日低點 {rd._p2(e.get('breakout_low'))}",
+                  f"   明天觸發需：今日最低 ≥ 突破日低點；{need}（即時 MA5）＋ 現價 > VWAP；{vol_txt}；預估成交額 ≥ {rd.A_MIN_EST_TURNOVER / 1e8:g} 億"]
+    if len(items) > POOL_DETAIL_MAX:
+        lines += ["", f"…另有 {len(items) - POOL_DETAIL_MAX} 檔（完整名單見 initial_pools.json 的 A2_tracking_pool）"]
+
+    # ---------- B 池 ----------
+    bc = init.get("B_candidates") or {}
+    n_watch = sum(1 for e in bc.values() if e.get("status") == "Watching")
+    lines += ["", f"🔵 <b>【B 池】{len(bc)} 檔</b>（全市場，不篩 5 日均量；Watching {n_watch}｜Active {len(bc) - n_watch}；"
+                  f"B 訊號日後最多等 {rd.B_WAIT_DAYS} 個交易日，10:00 起確認）"]
+    if not bc:
+        lines.append("目前沒有標的。")
+
+    def b_off(e):                                   # 明天是 B 訊號日後第幾個交易日（pools['days'] 已含基準日，所以 +1）
+        return rd.days_since(pools, e["burst_date"], inclusive=False) + 1
+
+    b_items = sorted(bc.items(), key=lambda kv: (0 if kv[1].get("status") == "Watching" else 1, -b_off(kv[1]), kv[0]))
+    for code, e in b_items[:POOL_DETAIL_MAX]:
+        b = base_of(code)
+        low = e["burst_low"]
+        yc = b.get("yest_close")
+        gap = rd._pc((yc / low - 1) * 100.0) if yc else "—"
+        avg5 = b.get("avg_5d_vol_simple")
+        avg5_txt = f"5 日均量 {avg5:,.0f} 張" if avg5 is not None else "5 日均量 —"
+        warn = "" if code in matrix else "｜⚠️ 沒有分時量矩陣，盤中不會被 B 確認"
+        kd = f"KD {e['kd_k']:.1f}/{e['kd_d']:.1f}｜" if e.get("kd_k") is not None else ""
+        head = f"<b>{code} {e.get('name', code)}</b>（{_MKT_LABEL.get(e.get('market'), '')}）"
+        if e.get("status") == "Watching":
+            off = b_off(e)
+            wait_txt = f"👀 明天第 {off}/{rd.B_WAIT_DAYS} 天" + ("（最後一天）" if off >= rd.B_WAIT_DAYS else "")
+        else:
+            wait_txt = f"✅ 已發動 {rd._md(e.get('entry_date'))} @ {rd._p2(e.get('entry_price'))}"
+        lines += ["",
+                  f"{head}｜{wait_txt}｜B 訊號日 {rd._md(e['burst_date'])} 防線 <code>{rd._p2(low)}</code>｜昨收 {rd._p2(yc)}（距防線 {gap}）{warn}",
+                  f"   {kd}爆量 {float(e.get('burst_ratio') or 0):.1f}x｜{avg5_txt}｜{e.get('trigger', '')}"]
+        if e.get("status") == "Watching":
+            cap = e.get("burst_vol")
+            cap_txt = (f"預估全日量 ≤ {cap * rd.B_SHRINK_RATIO:,.0f} 張（B 訊號日 {cap:,.0f} 張 × {rd.B_SHRINK_RATIO:g}）" if cap else "量縮條件不明")
+            lines.append(f"   明天確認需：今日最低 ≥ {rd._p2(low)}；現價 > {rd._p2(b.get('ma5_cut'))}（即時 MA5）＋ 現價 > VWAP；{cap_txt}；"
+                         f"預估成交額 ≥ {rd.B_MIN_EST_TURNOVER / 1e8:g} 億")
+    if len(b_items) > POOL_DETAIL_MAX:
+        lines += ["", f"…另有 {len(b_items) - POOL_DETAIL_MAX} 檔（完整名單見 initial_pools.json 的 B_candidates）"]
+
+    lines += ["", "ℹ️ 以上條件的價位只是依昨日收盤推算的門檻；盤中以即時價、VWAP、預估量為準，且需連續 2 輪符合才會通知。"]
+    return "\n".join(lines)
+
+
+# =========================
 # 主流程
 # =========================
 def _truthy(name: str) -> bool:
@@ -138,7 +243,7 @@ def already_done(feed):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("夜間運算 baseline.py v69.4（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
+    print("夜間運算 baseline.py v69.5（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
     print("=" * 55, flush=True)
     if not rd.B_FULL_MARKET:
         print("⚠️ rd.B_FULL_MARKET = False：夜間日 K 只抓快照成交量預篩後的股票，B 池不是全市場", flush=True)
@@ -156,7 +261,7 @@ def main() -> int:
 
     pools, pool_note = rd.load_pools()
     print(f"[追蹤清單] {pool_note}", flush=True)
-    tracked = rd.tracked_from_pools(pools)                 # A2 追蹤池：標記拉回整理
+    tracked = rd.tracked_from_pools(pools)                 # A1 追蹤 / A2 池：標記拉回整理
     extra = rd.extra_codes_from_pools(pools)               # 追蹤清單內的代號都要有日 K（收盤結算要用均線）
     all_bases = rd.load_all_stock_bases(feed, tracked, extra)
     if not all_bases:
@@ -202,7 +307,7 @@ def main() -> int:
     else:
         res = rd.settle_close(pools, sbases, rd.official_closes(bases), asof_str)
         settle_note = (f"⚠️ radar 當日沒有完成 13:35 結算，已用官方日 K 補結算：A1 收盤確認 {len(res['a1_confirmed'])} 檔、未確認 {len(res['a1_failed'])} 檔，"
-                       f"A2 追蹤池移出 {len(res['a_exits'])} 檔，B 池移出 {len(res['b_exits'])} 檔")
+                       f"A1 追蹤 / A2 池移出 {len(res['a_exits'])} 檔，B 池移出 {len(res['b_exits'])} 檔")
     print(f"[結算] {settle_note}", flush=True)
 
     # ---- A1 追蹤 / A2 池：用日 K 重算每檔追蹤標的的連續拉回整理天數，決定誰在「A1 追蹤」、誰進「A2 池」----
@@ -265,7 +370,7 @@ def main() -> int:
     b_codes = sorted(init["B_candidates"])
     n_b_low = sum(1 for cd in b_codes if cd in bases and not bases[cd]["liquid"])
     b_nomx = [cd for cd in b_codes if cd not in init["volume_time_matrix"]]
-    lines = [f"📦 <b>【夜間運算 v69.4】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
+    lines = [f"📦 <b>【夜間運算 v69.5】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
              f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜達標（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔",
              f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
              f"🟢 A1 追蹤 {c.get('a1_track', 0)} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內，還沒拉回，不會觸發 A2）",
@@ -289,8 +394,15 @@ def main() -> int:
     else:
         lines.append("⚠️ 沒有取得指數基準，明天盤前 radar 會自己補抓")
     lines.append(f"🔧 {settle_note}")
-    lines.append("明天 radar 啟動後直接讀 initial_pools.json，盤中不會再抓歷史資料。")
+    lines.append("明天 radar 啟動後直接讀 initial_pools.json，盤中不會再抓歷史資料。A2 池與 B 池的逐檔明細見下一則。")
     rd.send_telegram("\n".join(lines))
+
+    # ---- 第 2 則：A2 池 / B 池明細（失敗只記 log，不影響夜間運算結果）----
+    try:
+        detail = build_pool_detail_message(init, bases, pools, asof_str, index_ctx)
+        rd.send_telegram(detail)
+    except Exception as exc:
+        print(f"[Telegram] A2 / B 明細訊息產生或發送失敗（不影響夜間運算）：{type(exc).__name__}: {exc}", flush=True)
     return 0
 
 
