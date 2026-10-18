@@ -1,4 +1,4 @@
-"""夜間運算 baseline.py（v69.2）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
+"""夜間運算 baseline.py（v69.3）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
 價格與成交量全部來自富邦 Neo API；法人用官方資料（外資＋投信，只當參考）。建議 18:00 之後由 Google Apps Script 呼叫 baseline.yml（workflow_dispatch）觸發。
 流程：
   0. 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json → 直接結束（要強制重跑：workflow 手動執行時勾選 force，或環境變數 FORCE=1）
@@ -11,9 +11,10 @@
   5. 分時量矩陣：只替候選股（A1 候選 ＋ A2 追蹤池 ＋ B 池）抓 1 分 K，預先算好「開盤後每分鐘的歷史同期累積佔比」→ volume_time_matrix
      低量 B 候選（5 日均量 < 1,000 張）分 K 完整日門檻放寬，且不參與全市場曲線；仍算不出矩陣的會在 Telegram 列出（盤中不會被 B 確認）
   6. 官方法人（證交所 T86 ＋ 櫃買）近 5 日；只記錄、不篩選。櫃買表頭沒有法人名稱 → 依固定位置解析並用「三大法人合計」驗算
-  7. 加權、櫃買指數最近 19 個完整交易日收盤（隔天算盤中即時月線）；指數代號用名稱精確比對（radar.py v69.2）
+  7. 加權、櫃買指數最近 19 個完整交易日收盤（存 closes19 / sum19，隔天盤中每 15 秒明確算即時 MA20）；指數代號用名稱精確比對（radar.py v69.2 起）
+     v69.3：log 會印出前 19 日收盤明細、合計、穿越價 P，以及「看盤軟體基準日當天 MA20」供對帳（比 19 日窗口多含一天）
   8. 原子寫入 initial_pools.json（暫存檔 → fsync → os.replace），再存 signal_history.json。任何一步資料不完整 → 不覆寫前一版 initial_pools.json
-需要同資料夾的 radar.py（v69.2：夜間／盤中共用函式都在那裡）。
+需要同資料夾的 radar.py（v69.3：夜間／盤中共用函式都在那裡）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
@@ -135,7 +136,7 @@ def already_done(feed):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("夜間運算 baseline.py v69.2（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
+    print("夜間運算 baseline.py v69.3（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
     print("=" * 55, flush=True)
     if not rd.B_FULL_MARKET:
         print("⚠️ rd.B_FULL_MARKET = False：夜間日 K 只抓快照成交量預篩後的股票，B 池不是全市場", flush=True)
@@ -257,7 +258,7 @@ def main() -> int:
     b_codes = sorted(init["B_candidates"])
     n_b_low = sum(1 for cd in b_codes if cd in bases and not bases[cd]["liquid"])
     b_nomx = [cd for cd in b_codes if cd not in init["volume_time_matrix"]]
-    lines = [f"📦 <b>【夜間運算 v69.2】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
+    lines = [f"📦 <b>【夜間運算 v69.3】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
              f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜達標（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔",
              f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
              f"🟢 A2 追蹤池 {c['a2']} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內），其中拉回整理 {rd.A2_MIN_DAYS}～{rd.A2_MAX_DAYS} 天 {n_a2} 檔",
@@ -270,7 +271,11 @@ def main() -> int:
     for n in notes[:3]:
         lines.append(f"　　{n}")
     if index_ctx:
-        lines.append("🌡️ 趨勢基準：" + "｜".join(f"{v['name']} 月線穿越價 {v['p']:,.0f}（昨收 {v['last_close']:,.0f}，{v['init_state']}）" for v in index_ctx.values()))
+        for v in index_ctx.values():
+            lines.append(f"🌡️ {v['name']}：昨收 {v['last_close']:,.2f}｜明天開盤持平的即時 MA20 {v.get('ma20_flat') or 0:,.2f}"
+                         f"｜穿越價 {v['p']:,.2f}（前 19 日平均）｜{v['init_state']}"
+                         + (f"｜看盤軟體 {v.get('last_date')} 當天 MA20 應為 {v['ma20_asof']:,.2f}" if v.get("ma20_asof") else ""))
+        lines.append("　　盤中每 15 秒：即時 MA20 =（前 19 日收盤合計 + 即時指數）÷ 20，指數低於它就是月線下方")
         if "otc" not in index_ctx:
             lines.append("⚠️ 沒有櫃買指數基準：明天上櫃個股暫用加權指數判斷趨勢")
     else:
