@@ -156,7 +156,7 @@ A2_ENABLED = True
 A2_MIN_DAYS, A2_MAX_DAYS = 1, 6     # 拉回整理：連續「收盤 < MA5 且 ≥ MA10 且 ≥ 突破日低點」1～6 天
 A2_VOL_RATIO = 1.2                  # 預估全日量 ≥ 整理期平均量 × 1.2
 A2_REQUIRE_VWAP = True              # 現價 > 即時 VWAP
-A2_REQUIRE_ALL_MAS = False          # False = 只要現價 > 即時 MA5（你確認過的規則）；True = 現價必須同時 > 即時 MA5、MA10、MA20（「重新站回所有均線」）
+A2_REQUIRE_ALL_MAS = True           # False = 只要現價 > 即時 MA5（你確認過的規則）；True = 現價必須同時 > 即時 MA5、MA10、MA20（「重新站回所有均線」）
 A_TRACK_DAYS = 10                   # A1 收盤確認後追蹤 10 個交易日
 # 追蹤標的的兩個階段（同一份 signal_history.json 的 "a" 區塊，用 stage 欄位區分）：
 #   stage = "A1"：A1 收盤確認後追蹤中，還沒拉回整理（或拉回已超過 A2 窗口）。這時不會觸發 A2。
