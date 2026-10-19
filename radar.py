@@ -2086,10 +2086,12 @@ def start_prefetch(feed, pools: dict, today: date_cls):
         return None
 
 
-def scan_core(feed, asof: date_cls, series: dict, universe: dict, pools: dict, *, industry=None, curves_cache=None, snap=None, notes=None, ic_budget=None):
+def scan_core(feed, asof: date_cls, series: dict, universe: dict, pools: dict, *, industry=None, curves_cache=None, snap=None, notes=None, ic_budget=None,
+              max_new_curves=SCAN_MAX_NEW_CURVES):
     """收盤後選池核心（radar 13:35 之後、補歷史最後共用）。series 必須已經含 asof 當天的 K 棒；pools 必須已經結算過 asof。
     做的事（等同 v69 夜間 baseline 的選池部分）：全市場基底 → A1 候選池 → A1 追蹤 / A2 池階段重算 → B 池掃描 → 分時量矩陣 → 指數基準 → 原子寫入 initial_pools.json。
-    不做：官方法人（baseline 傍晚算，radar 隔天盤前讀 institutional.json）。成功回傳 (init, bases, index_ctx, info)；失敗丟 ScanError。"""
+    不做：官方法人（baseline 傍晚算，radar 隔天盤前讀 institutional.json）。成功回傳 (init, bases, index_ctx, info)；失敗丟 ScanError。
+    max_new_curves = 現場最多補抓幾檔 1 分 K（radar 有背景預抓，所以限 150 檔只補漏；補歷史沒有預抓，要傳 None = 不設上限，約 460 檔 × 1.15 秒 ≈ 9 分鐘）。"""
     asof_str = asof.isoformat()
     ok_series = {c: s for c, s in series.items() if s["dates"] and s["dates"][-1] == asof}
     if not universe or len(ok_series) / len(universe) < FETCH_MIN_COVERAGE:
@@ -2125,7 +2127,7 @@ def scan_core(feed, asof: date_cls, series: dict, universe: dict, pools: dict, *
     lowliq = {c for c in matrix_codes if not bases[c]["liquid"]}
     print(f"[候選池] A1 候選 {len(a1_codes)} 檔、A1 追蹤＋A2 池 {len(pools['a'])} 檔、B 池 {len(pools['b'])} 檔 → 分時量矩陣 {len(matrix_codes)} 檔（低量股 {len(lowliq)} 檔）", flush=True)
     matrix, matrix_days, matrix_note = build_volume_matrix(matrix_codes, asof, feed, lowliq, curves_cache=curves_cache,
-                                                           max_new=SCAN_MAX_NEW_CURVES, series=ok_series)
+                                                           max_new=max_new_curves, series=ok_series)
     if matrix is None:
         raise ScanError(f"分時量矩陣失敗：{matrix_note}")
     index_ctx = index_regime_snapshot(feed, asof)
