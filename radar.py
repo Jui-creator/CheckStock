@@ -1,41 +1,38 @@
-"""飆股雷達 v69.10：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構：APP SCRIPT 雙 Workflow＋分時量矩陣預計算」最終版）。
+"""飆股雷達 v70.0：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
-
-【觸發方式】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
-  18:00 後  baseline.yml → baseline.py ：盤後夜間運算，產出 initial_pools.json（隔日盤中唯一的靜態資料）＋更新 signal_history.json
-  08:00~09:00 daily.yml → radar.py       ：盤前載入、暖機、盤中 15 秒掃描、13:35 收盤結算（執行檔即「單一合併檔案」）
+【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
+  08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
+  18:00 後     baseline.yml → baseline.py ：只算官方外資、投信近 5 日買賣超 → 寫 institutional.json（隔天 radar 盤前讀取）
+  補歷史（只跑一次）history_backfill.yml → backfill_history.py：用日 K 重播最近 10 日，補好 signal_history.json，最後順便做一次收盤後選池
   radar.py 一律用 Asia/Taipei 判斷時間：09:00 前啟動就等到開盤；09:05 後才啟動視為「延遲啟動」，先暖機 2 輪再開放訊號；
-  13:25 後才啟動只做收盤結算。同一交易日 stock_states.json 已標 COMPLETED 時，重複觸發直接忽略。
-
+  13:25 後才啟動只做收盤結算＋選池（約 46 分鐘，因為沒有預抓）。同一交易日 stock_states.json 已標 COMPLETED 時，重複觸發直接忽略。
+【收盤後選池（13:35 之後，radar 自己做）】
+  資料來源：① 背景預抓（radar 一啟動就在背景慢慢抓，富邦限速約每秒 1 次）的「截至昨天」全市場日 K、產業別、候選股 1 分 K；
+            ② 13:35 最終快照合成的「今天」日 K 棒（開高低收量額）；③ 即時指數（今天收盤）。
+  做的事：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ 昨日最高均線）、A1 追蹤 / A2 池階段重算、B 池全市場掃描（KD 低檔金叉＋爆量＋收盤位置）、
+          分時量矩陣（20 個交易日截至昨天）、指數前 19 日收盤 → 原子寫入 initial_pools.json，並發一則【盤後運算】Telegram。
+  官方資料要等到：三大法人（證交所 T86、櫃買）約傍晚；富邦歷史日 K / 1 分 K 當日資料盤後 16:30 才更新 → 所以今天的 K 棒用快照合成
+  （成交量比官方日 K 約少 1～2%：官方含盤後零股／定價；隔天預抓到的就是官方值，自動修正）。
 【市場趨勢：只有 NORMAL / BEAR 兩態（上市用加權、上櫃用櫃買，各自獨立）】
-  即時月線 MA20 =（前 19 個完整交易日指數收盤 + 盤中即時指數）/ 20：前 19 日收盤夜間算好存進 initial_pools.json（closes19），盤中每 15 秒用最新指數明確算出即時 MA20 再比較；
-  （數學上等價於 指數 ≥ 穿越價 P = 前 19 日收盤平均；P 只用來顯示與驗算。）
+  即時月線 MA20 =（前 19 個完整交易日指數收盤 + 盤中即時指數）/ 20：前 19 日收盤收盤後算好存進 initial_pools.json（closes19），盤中每 15 秒用最新指數明確算出即時 MA20 再比較；
   NORMAL：A1 預估量 ≥ 5 日均量 × 1.5（搭配同期量比）、A2 開放、B 開放。
   BEAR  ：A1 預估量 ≥ 5 日均量 × 2.0（搭配同期量比）、A2 禁止、B 開放。
   切換防抖：NORMAL→BEAR 連續 2 輪低於即時月線；BEAR→NORMAL 站回即時月線並連續維持 5 分鐘；正式切換才 Telegram 通知一次。
   沒有 Hard Freeze，也沒有 DATA_ERROR_FREEZE。
-
-【夜間（baseline.py）→ initial_pools.json】
-  A1 候選池：5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ max(昨日 MA5/10/20)；隔天盤中 A1 只掃描這批，不在盤中重新篩全市場。
-  A1 追蹤 / A2 池（v69.9）：A1 收盤確認成功（盤中通知過但收盤沒站穩的不進）後先在「A1 追蹤」。
-  A1 追蹤的 10 個交易日只是「等它拉回」的窗口：某天收盤跌破 MA5 且守住 MA10 與突破日低點 → 進「A2 池」（連續拉回 1～6 天）；
-  站回 MA5 → 回 A1 追蹤。移出條件：收盤跌破 MA10 或突破日低點（A1 追蹤、A2 池都一樣）；A2 池連續拉回超過 6 天仍沒站回 MA5 → 直接移出（不回 A1）；
-  A1 追蹤滿 10 個交易日、而且當下不在拉回（沒進 A2）→ 移出；已經在 A2 池的不受 10 天限制。只有 A2 池才可能觸發 A2。
-  B 候選池（v69.2 全市場，不篩 5 日均量）：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
-  volume_time_matrix：每檔候選股、開盤後每一分鐘的「歷史同期累積量佔比」全部夜間算好；盤中只查表，不碰歷史分 K。
-  initial_pools.json 一律「暫存檔 → fsync → os.replace」原子寫入；資料不完整時不覆寫前一版。
-
+【A1 追蹤 / A2 池】A1 收盤確認成功（盤中通知過但收盤沒站穩的不進）後先在「A1 追蹤」；某天收盤跌破 MA5 且守住 MA10 與突破日低點 → 進「A2 池」（連續拉回 1～6 天）；
+  站回 MA5 → 回 A1 追蹤。移出：收盤跌破 MA10 或突破日低點（兩階段都一樣）；A2 池連續拉回超過 6 天仍沒站回 MA5 → 直接移出；
+  A1 追蹤滿 10 個交易日且當下不在拉回 → 移出；已在 A2 池的不受 10 天限制。只有 A2 池才可能觸發 A2。
+【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：昨收 ≤ 昨日最高均線；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
-  A2：僅 A2 池內（A1 追蹤中、曾收盤跌破 MA5 但守住 MA10 與突破日低點）整理 1~6 天（連續 1~6 個交易日收盤 < MA5、守住 MA10 與突破日低點；只跌破 1 天、今天就站回也算）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；
-      預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
+  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
-【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → A1_CLOSE_CONFIRMED 進 A1 追蹤；A1 追蹤 / A2 池收盤跌破 MA10 或突破日低點移出、A2 拉回逾 6 日移出、A1 追蹤滿 10 日沒進 A2 移出；
-  B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出（不發停損／出場通知）；寫 signal_history.json、pool_report.csv。
-  18:00 後 baseline 會用官方日 K 核對當日 A1 收盤確認（close_provisional → official_reconciled）。
-【檔案】initial_pools.json（夜間產出，盤中唯讀）、signal_history.json（追蹤清單，結算後更新）、stock_states.json（當日已通知名單＋趨勢狀態＋執行鎖）、pool_report.csv
+【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → 進 A1 追蹤；A1 追蹤 / A2 池依上面的規則移出；B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出
+  （不發停損／出場通知）；寫 signal_history.json、pool_report.csv。結算完接著「收盤後選池」；選池成功才發【盤後運算】（取代舊的 13:35 盤後總結，避免同一天通知兩次池）；選池失敗才補發盤後總結＋警告。
+【檔案】initial_pools.json（收盤後選池產出，隔天盤中唯讀）、institutional.json（baseline 傍晚產出，radar 盤前讀）、signal_history.json（追蹤清單）、
+        stock_states.json（當日已通知名單＋趨勢狀態＋執行鎖）、pool_report.csv
 【環境變數】TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS（憑證 fubon.p12；可用 FUBON_CERT_PATH 改路徑）、DEBUG_CODES=2330,2317（可選）
 """
 import os
@@ -125,13 +122,22 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v69.10"
+RADAR_VERSION = "v70.0"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
 CLOSED_KEEP = 300
 DAYS_KEEP = 90
 ONE_SIGNAL_PER_STOCK = True         # 同一檔同一天只發一種主訊號（優先序 A2 > A1 > B）
+# ---- v70：收盤後選池 ＋ 法人檔 ----
+SCAN_ENABLED = True                 # True = 13:35 結算後接著選池並寫 initial_pools.json；False = 不選池（要自己另外產生 initial_pools.json）
+SCAN_WAIT_PREFETCH_SEC = 3600       # 選池開始時背景預抓還沒做完，最多再等幾秒；仍不足（覆蓋率 < FETCH_MIN_COVERAGE）就放棄這次選池
+SCAN_WAIT_CURVES_SEC = 600          # 日 K 預抓完成後，等 1 分 K 預抓再做多久（逾時就用已抓到的，其餘現場補抓）
+SCAN_MAX_NEW_CURVES = 150           # 現場最多補抓幾檔 1 分 K（預抓沒涵蓋到的新候選）；超過的略過，盤中不會被確認
+SCAN_IC_BUDGET_SECONDS = 60         # 產業鏈補查時間上限（已有 30 天快取，通常只補幾檔；補不到下次再補）
+POOL_DETAIL_MAX = 25                # 盤後運算訊息：每個池最多列幾檔，其餘用「…另有 N 檔」帶過
+INST_FILE = BASE_DIR / "institutional.json"
+INST_RULE = "inst1"
 
 # ---- 富邦日 K ----
 LOOKBACK_CALENDAR_DAYS = 120
@@ -456,11 +462,12 @@ async def _fetch_one_chain(session, semaphore, code):
         return code, parse_company_chain_html(page)
 
 
-async def refresh_ic_chains(codes) -> dict:
+async def refresh_ic_chains(codes, budget=None) -> dict:
+    budget = IC_FETCH_BUDGET_SECONDS if budget is None else budget
     today = now_tw().date()
     cache = _load_ic_cache()
     todo = [c for c in codes if not (c in cache and _ic_cache_fresh(cache[c], today))]
-    print(f"[產業鏈] 快取 {len(codes) - len(todo)} 檔有效，需補查 {len(todo)} 檔（本次最多 {IC_FETCH_BUDGET_SECONDS} 秒）", flush=True)
+    print(f"[產業鏈] 快取 {len(codes) - len(todo)} 檔有效，需補查 {len(todo)} 檔（本次最多 {budget} 秒）", flush=True)
     fetched_ok = not_listed = failed = 0
     layout_errors = 0
     if todo:
@@ -470,7 +477,7 @@ async def refresh_ic_chains(codes) -> dict:
         async with aiohttp.ClientSession(connector=connector, headers=IC_HEADERS) as session:
             batch_size = IC_MAX_CONCURRENCY * 10
             for i in range(0, len(todo), batch_size):
-                if time.time() - started > IC_FETCH_BUDGET_SECONDS:
+                if time.time() - started > budget:
                     print(f"[產業鏈] 已達時間上限，剩餘 {len(todo) - i} 檔下次再補", flush=True)
                     break
                 results = await asyncio.gather(
@@ -1406,7 +1413,7 @@ def a1_confirm_settle(pools: dict, bases: dict, closes: dict, today_str: str, sk
                  "entry_date": today_str, "entry_time": e.get("notify_time", ""), "entry_price": e.get("notify_price"),
                  "breakout_low": low, "status": "Active", "stage": "A1", "pullback_days": 0, "origin": "A1_CLOSE_CONFIRMED",
                  "last_close": close, "last_date": today_str,
-                 "miss_days": 0, "a2_dates": [], "close_src": "final_snapshot", "close_provisional": True, "src": "live"}
+                 "miss_days": 0, "a2_dates": [], "close_src": "final_snapshot", "close_provisional": False, "src": "live"}
         pools["a"][code] = new_e
         codes.append(code)
         rows.append(_a_row(pools, code, new_e, close, ma5, ma10, ma20, True))
@@ -1597,7 +1604,7 @@ def build_entry(curves: dict, days: list):
         r[j] = max(r[j], r[j - 1])
     r[-1] = 1.0
     last = curves[days[-1]][-1] if days[-1] in curves else None
-    return {"r": r, "last": last, "n": len(full)}
+    return {"r": r, "last": last, "last_day": days[-1] if last is not None else None, "n": len(full)}
 
 
 def blend_r(entries: dict, ref=None) -> None:
@@ -1630,38 +1637,59 @@ def fetch_minute_curves(feed, code: str, days: list, chunk: int, min_candles: in
     return day_curves(candles, days, min_candles), len(candles)
 
 
-def check_against_snapshot(feed, entries: dict, asof: str) -> str:
-    """分 K 加總（基準日全日量）對照富邦快照的 tradeVolume。"""
+class CurveFetcher:
+    """1 分 K → 累積量曲線。前 3 檔驗證「一次請求多日」是否回傳完整；不完整就自動改成每 5 個交易日一段（背景預抓與現場補抓共用）。"""
+
+    def __init__(self, feed, days: list):
+        self.feed, self.days, self.chunk, self.probe = feed, days, BASELINE_CHUNK_DAYS, []
+
+    def fetch(self, code: str, min_candles: int = None) -> dict:
+        curves, n_candles = fetch_minute_curves(self.feed, code, self.days, self.chunk, min_candles)
+        if len(self.probe) < 3:
+            self.probe.append(len(curves) / max(1, len(self.days)))
+            print(f"  [診斷] {code}：分K {n_candles} 根（每段 {self.chunk} 日），完整日 {len(curves)}/{len(self.days)}", flush=True)
+            if len(self.probe) == 3 and self.chunk > 5 and sum(1 for p in self.probe if p < 0.7) >= 2:
+                self.chunk = 5
+                print("  [診斷] 一次請求多日只拿到部分日期 → 改成每 5 個交易日一段（耗時會變長）", flush=True)
+                send_telegram(f"⚠️ <b>【分時量矩陣】</b> 富邦 1 分 K 一次請求 {BASELINE_CHUNK_DAYS} 個交易日回傳不完整，已自動改成每 5 日一段（耗時約 4 倍）。")
+                curves, n_candles = fetch_minute_curves(self.feed, code, self.days, self.chunk, min_candles)
+        return curves
+
+
+def check_against_daily(entries: dict, series: dict) -> str:
+    """分 K 加總（最後一個取樣日的全日量）對照同一天的日 K 成交量，確認單位。
+    官方日 K 的量含盤後零股 / 定價，通常比分 K 加總多約 1～2%，所以容許 ±5%。"""
     import statistics
-    try:
-        snap = feed.snapshot_all()
-    except Exception as exc:
-        return f"快照對照略過（{type(exc).__name__}）"
-    dates = {str(m.get("date", "")).replace("-", "") for m in snap["meta"].values()}
-    if asof.replace("-", "") not in dates:
-        return f"快照日期 {sorted(dates)} 不是基準日 {asof}，對照略過"
     ratios = []
     for code, e in entries.items():
-        row = snap["rows"].get(code)
-        tv = _f(row.get("tradeVolume")) if row else None
-        if tv and tv > 0 and e.get("last"):
-            ratios.append(e["last"] / tv)
-    if not ratios:
-        return "快照沒有可對照的資料"
+        s = series.get(code)
+        if not s or not e.get("last") or not e.get("last_day"):
+            continue
+        try:
+            i = [d.isoformat() for d in s["dates"]].index(e["last_day"])
+        except ValueError:
+            continue
+        if s["v"][i] and s["v"][i] > 0:
+            ratios.append(e["last"] / s["v"][i])
+    if len(ratios) < 10:
+        return "分K / 日K 對照略過（可對照的股票太少）"
     med = statistics.median(ratios)
-    near = sum(1 for r in ratios if abs(r - 1) <= 0.02) / len(ratios)
-    verdict = "✅ 一致" if abs(med - 1) <= 0.02 and near >= 0.8 else "⚠️ 不一致，請檢查單位或 13:30 收盤集合競價那一根"
-    return f"分K加總 / 快照全日量：中位數 {med:.3f}，±2% 內 {near:.0%}（{len(ratios)} 檔）{verdict}"
+    near = sum(1 for r in ratios if abs(r - 1) <= 0.05) / len(ratios)
+    verdict = "✅ 一致" if abs(med - 1) <= 0.05 else "⚠️ 不一致，請檢查單位或 13:30 收盤集合競價那一根"
+    return f"分K加總 / 日K成交量：中位數 {med:.3f}，±5% 內 {near:.0%}（{len(ratios)} 檔）{verdict}"
 
 
-def build_volume_matrix(codes, asof: date_cls, feed, lowliq=None):
+def build_volume_matrix(codes, asof: date_cls, feed, lowliq=None, curves_cache=None, max_new=None, series=None):
     """用富邦 1 分 K 為「候選股」預先算好分時累積佔比矩陣。成功回傳 (entries, days, 說明)；失敗（會發 Telegram）回傳 (None, None, 原因)。
-    entries = {代號: {"r": [272 個佔比], "last": 基準日全日量, "n": 完整日數}}；寫檔由呼叫端（baseline.py）一次寫進 initial_pools.json。
+    取樣日 = 截至 asof 富邦已經有的最近 R_DAYS 個交易日（13:35 收盤後算的時候，今天的 1 分 K 還沒更新，所以是截至昨天；傍晚以後算就會含今天）。
+    curves_cache = 背景預抓好的 {代號: 曲線}（低量股的完整日門檻不同，不用快取）；max_new = 現場最多補抓幾檔，超過的略過；series = 日 K（用來對照單位）。
+    entries = {代號: {"r": [272 個佔比], "last": 最後取樣日全日量, "n": 完整日數}}；寫檔由呼叫端一次寫進 initial_pools.json。
     lowliq = 5 日均量 < 1,000 張的候選（B 池全市場）：分 K 完整日門檻降為 B_LOWLIQ_MIN_CANDLES，且不參與「全市場曲線」的計算。
     回傳的說明字串會註明有幾檔低量股沒算出矩陣（這些股票盤中不會被 B 確認）。"""
     lowliq = set(lowliq or ())
+    curves_cache = curves_cache or {}
     started = time.time()
-    title = "【分時量矩陣】夜間預計算"
+    title = "【分時量矩陣】盤後預計算"
     universe = sorted(codes)
     try:
         days = trading_days(feed, asof)
@@ -1669,59 +1697,49 @@ def build_volume_matrix(codes, asof: date_cls, feed, lowliq=None):
         msg = f"查詢富邦交易日失敗：{type(exc).__name__}: {exc}"
         send_telegram(f"❌ <b>{title}</b> {msg}")
         return None, None, msg
-    if len(days) < R_MIN_DAYS or days[-1] != asof.isoformat():
-        msg = f"富邦日 K 的最後交易日是 {days[-1] if days else '無'}，與基準日 {asof} 不符（富邦歷史資料盤後 16:30 才更新，請稍後重跑）"
+    if len(days) < R_MIN_DAYS:
+        msg = f"富邦只查到 {len(days)} 個交易日（至少要 {R_MIN_DAYS} 個）"
         send_telegram(f"❌ <b>{title}</b> {msg}")
         return None, None, msg
-    print(f"[分時量矩陣] 基準日 {asof}，候選 {len(universe)} 檔，取樣 {len(days)} 日：{days[0]} ～ {days[-1]}", flush=True)
-    chunk = BASELINE_CHUNK_DAYS
-    entries, skipped, errors, probe = {}, [], 0, []
+    print(f"[分時量矩陣] 基準日 {asof}，候選 {len(universe)} 檔（預抓 {sum(1 for c in universe if c in curves_cache)} 檔），取樣 {len(days)} 日：{days[0]} ～ {days[-1]}", flush=True)
+    fetcher = CurveFetcher(feed, days)
+    entries, skipped, errors, new_fetched = {}, [], 0, 0
     for n, code in enumerate(universe, 1):
-        try:
-            curves, n_candles = fetch_minute_curves(feed, code, days, chunk, B_LOWLIQ_MIN_CANDLES if code in lowliq else None)
-        except Exception as exc:
-            errors += 1
-            skipped.append(code)
-            print(f"  {code} 抓取失敗：{type(exc).__name__}: {exc}", flush=True)
-            continue
-        if n <= 3:
-            print(f"  [診斷] {code}：分K {n_candles} 根（每段 {chunk} 日），完整日 {len(curves)}/{len(days)}", flush=True)
-            probe.append(len(curves) / len(days))
-            if n == 3 and chunk > 5 and sum(1 for p in probe if p < 0.7) >= 2:
-                chunk = 5
-                print("  [診斷] 一次請求多日只拿到部分日期 → 改成每 5 個交易日一段，重抓前 3 檔（耗時會變長）", flush=True)
-                send_telegram(f"⚠️ <b>{title}</b> 富邦 1 分 K 一次請求 {BASELINE_CHUNK_DAYS} 個交易日回傳不完整，已自動改成每 5 日一段（耗時約 4 倍）。")
-                entries.clear()
-                skipped.clear()
-                for c2 in universe[:3]:
-                    cv, _ = fetch_minute_curves(feed, c2, days, chunk, B_LOWLIQ_MIN_CANDLES if c2 in lowliq else None)
-                    e2 = build_entry(cv, days)
-                    if e2:
-                        entries[c2] = e2
-                    else:
-                        skipped.append(c2)
+        low = code in lowliq
+        curves = None if low else curves_cache.get(code)
+        if curves is None:
+            if max_new is not None and new_fetched >= max_new:
+                skipped.append(code)
+                continue
+            new_fetched += 1
+            try:
+                curves = fetcher.fetch(code, B_LOWLIQ_MIN_CANDLES if low else None)
+            except Exception as exc:
+                errors += 1
+                skipped.append(code)
+                print(f"  {code} 抓取失敗：{type(exc).__name__}: {exc}", flush=True)
                 continue
         entry = build_entry(curves, days)
         if entry is None:
             skipped.append(code)
         else:
             entries[code] = entry
-        if n % 50 == 0:
-            print(f"  進度 {n}/{len(universe)}，成功 {len(entries)}，略過 {len(skipped)}，已用 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
+        if n % 100 == 0:
+            print(f"  進度 {n}/{len(universe)}，成功 {len(entries)}，略過 {len(skipped)}，現場補抓 {new_fetched}，已用 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
     coverage = len(entries) / len(universe) if universe else 0
     if coverage < BASELINE_MIN_COVERAGE:
         msg = f"成功率只有 {coverage:.0%}（{len(entries)}/{len(universe)}，抓取錯誤 {errors}）"
         send_telegram(f"❌ <b>{title}</b> {msg}，未更新 initial_pools.json。請看 Actions log 的診斷行。")
         return None, None, msg
-    check_text = check_against_snapshot(feed, entries, asof.isoformat())
+    check_text = check_against_daily(entries, series) if series else "（未對照日 K）"
     print(f"[分時量矩陣] {check_text}", flush=True)
     blend_r(entries, ref=set(entries) - lowliq)
     minutes = (time.time() - started) / 60
-    skipped_txt = f"｜略過 {len(skipped)} 檔（完整日不足 {R_MIN_DAYS} 天或抓取失敗）" if skipped else ""
+    skipped_txt = f"｜略過 {len(skipped)} 檔（完整日不足 {R_MIN_DAYS} 天、抓取失敗或超過現場補抓上限）" if skipped else ""
     skipped_low = [c for c in skipped if c in lowliq]
     if skipped_low:
         skipped_txt += f"，其中低量股 {len(skipped_low)} 檔（{'、'.join(skipped_low[:8])}{'…' if len(skipped_low) > 8 else ''}）盤中不會被 B 確認"
-    note = f"涵蓋 {len(entries)}/{len(universe)} 檔{skipped_txt}｜耗時 {minutes:.1f} 分鐘｜{check_text}"
+    note = f"涵蓋 {len(entries)}/{len(universe)} 檔{skipped_txt}｜現場補抓 {new_fetched} 檔，耗時 {minutes:.1f} 分鐘｜{check_text}"
     print(f"[分時量矩陣] 完成：{note}", flush=True)
     return entries, days, note
 
@@ -1904,6 +1922,297 @@ def load_all_stock_bases(feed, tracked: dict = None, extra=None) -> dict:
     print(f"預載完成：{len(bases)} 檔（上市 {tse} / 上櫃 {len(bases) - tse}），5 日均量 ≥ {MIN_VOL5_LOTS:,} 張 {liquid} 檔｜"
           f"B 型態候選 {n_b} 檔、A2 拉回整理中 {n_a2} 檔｜日K失敗 {fail} 檔，耗時 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
     return bases
+
+
+# =========================
+# 收盤後選池（v70）：歷史日 K（背景預抓）＋ 當天最終快照 → 明天的 A1 / A2 / B 池
+# =========================
+class ScanError(Exception):
+    """收盤後選池失敗（資料不足 / 抓取失敗）。訊息會顯示在 Telegram。"""
+
+
+def bars_from_snapshot(snap: dict, day: date_cls) -> dict:
+    """最終快照 → 當天日 K 棒 {代號: {date, open, high, low, close, volume(張), value(元)}}。
+    只收「收盤價已產生且不是試撮」而且有成交的股票（停牌 / 暫緩收盤的略過，今晚不納入選池）。"""
+    out = {}
+    for code, row in snap["rows"].items():
+        info, _ = close_info_from_row(row)
+        if not info or info["vol"] <= 0:
+            continue
+        close = info["close"]
+        out[code] = {"date": day, "open": info["open"] or close, "high": info["high"], "low": info["low"], "close": close,
+                     "volume": info["vol"], "value": info["val"] or close * info["vol"] * 1000.0}
+    return out
+
+
+def merge_today_bar(series: dict, bars: dict, day: date_cls) -> int:
+    """把當天的 K 棒接在歷史日 K 後面（歷史已經有當天的官方資料就不動）。回傳接上幾檔。"""
+    n = 0
+    for code, s in series.items():
+        bar = bars.get(code)
+        if bar is None or not s["dates"] or s["dates"][-1] >= day:
+            continue
+        s["dates"].append(day)
+        s["o"].append(bar["open"])
+        s["h"].append(bar["high"])
+        s["l"].append(bar["low"])
+        s["c"].append(bar["close"])
+        s["v"].append(bar["volume"])
+        s["val"].append(bar["value"])
+        n += 1
+    return n
+
+
+def unit_sanity(feed, series: dict, bars: dict, day: date_cls) -> str:
+    """歷史日 K 最後一天（昨天）的成交量 ÷ 今天快照的成交量，中位數應該在 1 附近（相鄰兩天量能差不多）。
+    若比值約 0.001 → 日 K 的量其實已經是「張」，自動 ×1000 校正；差很多就在訊息裡提醒。"""
+    import statistics
+    ratios = [s["v"][-1] / bars[c]["volume"] for c, s in series.items()
+              if c in bars and s["dates"] and s["dates"][-1] < day and s["v"][-1] > 0 and bars[c]["volume"] > 0]
+    if len(ratios) < 20:
+        return ""
+    med = statistics.median(ratios)
+    if 0.0008 <= med <= 0.0012:
+        for s in series.values():
+            s["v"] = [x * 1000.0 for x in s["v"]]
+        feed.daily_vol_div = 1.0
+        return f"日K成交量單位其實是「張」（昨日 / 今日快照量中位數 {med:.4f}），已自動校正"
+    if not (0.2 <= med <= 5.0):
+        return f"日K成交量與今日快照量級差很多（昨日 / 今日中位數 {med:.3f}），請檢查單位"
+    return ""
+
+
+def build_universe(snap: dict, pools: dict) -> dict:
+    """要抓日 K 的股票：pick_universe（B_FULL_MARKET = 全市場）＋ 追蹤清單內的代號（即使被濾掉也要有日 K）。"""
+    uni = pick_universe(snap)
+    for code in set(tracked_from_pools(pools)) | extra_codes_from_pools(pools):
+        if code in snap["rows"] and code not in uni:
+            row = snap["rows"][code]
+            uni[code] = {"name": str(row.get("name") or code), "market": row["_mkt"], "snap_vol": _f(row.get("tradeVolume")) or 0.0}
+    return uni
+
+
+class MarketPrefetch:
+    """背景預抓（v70）：radar 一啟動就在背景執行緒慢慢抓「截至昨天」的全市場日 K、產業別、一般股的 1 分 K
+    （富邦限速約每秒 1 次：日 K 約 37 分鐘、1 分 K 約 11 分鐘，盤中就會抓完）。13:35 收盤後要選明天的池時，資料已經在記憶體，不用再等。
+    主迴圈與背景共用同一把 SDK 鎖，每次呼叫只占用一次 HTTP 的時間，不會卡住 15 秒一輪的快照。"""
+
+    def __init__(self, feed, universe: dict, start: date_cls, end: date_cls):
+        self.feed, self.universe, self.start_day, self.end_day = feed, universe, start, end
+        self.series, self.industry, self.curves = {}, {}, {}
+        self.fail, self.error = 0, None
+        self.stop = threading.Event()
+        self.hist_done = threading.Event()
+        self.all_done = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="market-prefetch", daemon=True)
+        self._thread.start()
+
+    def run_blocking(self) -> None:
+        self._run()
+
+    def wait_hist(self, timeout: float) -> bool:
+        return self.hist_done.wait(timeout)
+
+    def wait_all(self, timeout: float) -> bool:
+        return self.all_done.wait(timeout)
+
+    def coverage(self):
+        return len(self.series), len(self.universe)
+
+    def _run(self) -> None:
+        try:
+            try:
+                self.industry = self.feed.industry_map()
+            except Exception as exc:
+                print(f"[預抓] 產業別查詢失敗：{type(exc).__name__}: {exc}", flush=True)
+            self._fetch_hist()
+            self.hist_done.set()
+            self._fetch_curves()
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            print(f"[預抓] 中斷：{self.error}", flush=True)
+        finally:
+            self.hist_done.set()
+            self.all_done.set()
+
+    def _fetch_hist(self) -> None:
+        started, total = time.time(), len(self.universe)
+        print(f"[預抓] 日K {total:,} 檔（{self.start_day} ～ {self.end_day}），約 {total * BASELINE_CALL_INTERVAL / 60:.0f} 分鐘", flush=True)
+        for i, (code, u) in enumerate(sorted(self.universe.items()), 1):
+            if self.stop.is_set():
+                return
+            try:
+                rows = self.feed.daily_candles(code, self.start_day, self.end_day)
+            except Exception as exc:
+                self.fail += 1
+                print(f"  {code} 日K抓取失敗：{type(exc).__name__}: {exc}", flush=True)
+                continue
+            if rows:
+                self.series[code] = series_from_candles(u["name"], u["market"], rows)
+            if i % 200 == 0 or i == total:
+                print(f"[預抓] 日K進度 {i}/{total}，成功 {len(self.series)}，失敗 {self.fail}，已用 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
+
+    def _fetch_curves(self) -> None:
+        codes = sorted(c for c, s in self.series.items() if len(s["v"]) >= 5 and sum(s["v"][-5:]) / 5 >= MIN_VOL5_LOTS)
+        days = trading_days(self.feed, self.end_day)
+        if len(days) < R_MIN_DAYS or not codes:
+            return
+        started = time.time()
+        print(f"[預抓] 1 分 K：一般股 {len(codes)} 檔，取樣 {len(days)} 日（{days[0]} ～ {days[-1]}），約 {len(codes) * BASELINE_CALL_INTERVAL / 60:.0f} 分鐘", flush=True)
+        fetcher = CurveFetcher(self.feed, days)
+        for i, code in enumerate(codes, 1):
+            if self.stop.is_set():
+                return
+            try:
+                self.curves[code] = fetcher.fetch(code)
+            except Exception as exc:
+                print(f"  {code} 1 分 K 預抓失敗：{type(exc).__name__}: {exc}", flush=True)
+            if i % 100 == 0 or i == len(codes):
+                print(f"[預抓] 1 分 K 進度 {i}/{len(codes)}，成功 {len(self.curves)}，已用 {(time.time() - started) / 60:.1f} 分鐘", flush=True)
+
+
+def start_prefetch(feed, pools: dict, today: date_cls):
+    """啟動背景預抓。失敗回傳 None（13:35 選池時改成現場抓，約 46 分鐘）。"""
+    try:
+        snap = feed.snapshot_all()
+        pf = MarketPrefetch(feed, build_universe(snap, pools), today - timedelta(days=LOOKBACK_CALENDAR_DAYS), today)
+        pf.start()
+        return pf
+    except Exception as exc:
+        print(f"[預抓] 啟動失敗（{type(exc).__name__}: {exc}），收盤後選池時改成現場抓", flush=True)
+        return None
+
+
+def scan_core(feed, asof: date_cls, series: dict, universe: dict, pools: dict, *, industry=None, curves_cache=None, snap=None, notes=None, ic_budget=None):
+    """收盤後選池核心（radar 13:35 之後、補歷史最後共用）。series 必須已經含 asof 當天的 K 棒；pools 必須已經結算過 asof。
+    做的事（等同 v69 夜間 baseline 的選池部分）：全市場基底 → A1 候選池 → A1 追蹤 / A2 池階段重算 → B 池掃描 → 分時量矩陣 → 指數基準 → 原子寫入 initial_pools.json。
+    不做：官方法人（baseline 傍晚算，radar 隔天盤前讀 institutional.json）。成功回傳 (init, bases, index_ctx, info)；失敗丟 ScanError。"""
+    asof_str = asof.isoformat()
+    ok_series = {c: s for c, s in series.items() if s["dates"] and s["dates"][-1] == asof}
+    if not universe or len(ok_series) / len(universe) < FETCH_MIN_COVERAGE:
+        raise ScanError(f"日 K 覆蓋率過低（有 {asof_str} 這一天的 {len(ok_series)} 檔 / 範圍 {len(universe)} 檔）")
+    mark_unreliable(universe, ok_series)
+    tracked, extra = tracked_from_pools(pools), extra_codes_from_pools(pools)
+    all_bases = {}
+    for code, s in ok_series.items():
+        b = make_base(code, s, (industry or {}).get(code, ""), tracked.get(code))
+        if b:
+            all_bases[code] = b
+    bases = {c: b for c, b in all_bases.items()
+             if (b["liquid"] or c in extra or b.get("b_hit")) and b["market"] not in UNRELIABLE_MARKETS}
+    liquid = {c: b for c, b in bases.items() if b["liquid"]}
+    if not liquid:
+        raise ScanError("沒有可用的股票（日 K 資料不完整或均量不足）")
+    n_b_hit = sum(1 for b in all_bases.values() if b.get("b_hit"))
+    print(f"掃描 {len(all_bases):,} 檔｜達標（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔｜今晚 B 型態命中 {n_b_hit} 檔", flush=True)
+    try:
+        chain_map = asyncio.run(refresh_ic_chains(sorted(liquid), budget=ic_budget))
+    except Exception as exc:
+        print(f"[產業鏈] 查詢流程例外，改用富邦產業別: {type(exc).__name__}: {exc!r}", flush=True)
+        chain_map = {}
+    apply_ic_chains(bases, chain_map)
+    stage_cnt = apply_a_stages(pools, bases, asof_str)
+    print(f"[A 追蹤] A1 追蹤 {stage_cnt['a1']} 檔｜A2 池（拉回 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天）{stage_cnt['a2']} 檔｜拉回逾 {A2_MAX_DAYS} 天移出 {stage_cnt.get('removed', 0)} 檔", flush=True)
+    for cd, e in sorted(pools["a"].items()):
+        print(f"    {cd} {e.get('name', '')}｜{e.get('stage')}｜A1 確認 {e.get('entry_date')}｜連續拉回 {e.get('pullback_days', 0)} 天", flush=True)
+    merge = merge_b_candidates(pools, bases)
+    print(f"[B 池] 今晚新增 {merge['added']} 檔、略過 {merge['skipped']} 檔（已在池中或同一訊號日已移出）", flush=True)
+    a1_codes = [c for c, b in bases.items() if b["liquid"] and b["yest_close"] <= b["prev_ma_max"]]
+    matrix_codes = sorted(c for c in (set(a1_codes) | set(pools["a"]) | set(pools["b"])) if c in bases)
+    lowliq = {c for c in matrix_codes if not bases[c]["liquid"]}
+    print(f"[候選池] A1 候選 {len(a1_codes)} 檔、A1 追蹤＋A2 池 {len(pools['a'])} 檔、B 池 {len(pools['b'])} 檔 → 分時量矩陣 {len(matrix_codes)} 檔（低量股 {len(lowliq)} 檔）", flush=True)
+    matrix, matrix_days, matrix_note = build_volume_matrix(matrix_codes, asof, feed, lowliq, curves_cache=curves_cache,
+                                                           max_new=SCAN_MAX_NEW_CURVES, series=ok_series)
+    if matrix is None:
+        raise ScanError(f"分時量矩陣失敗：{matrix_note}")
+    index_ctx = index_regime_snapshot(feed, asof)
+    if not index_ctx:
+        print("[指數] 沒有取得任何指數基準，隔天 radar 會自己補抓（盤前）", flush=True)
+    init = assemble_initial_pools(bases, pools, asof_str, index_ctx, {}, matrix, matrix_days, matrix_note, notes=list(notes or []))
+    save_initial_pools(init)                                # 先存 initial_pools.json（原子寫入），再存追蹤清單
+    save_pools(pools)
+    info = {"market_total": len(snap["rows"]) if snap else len(universe), "n_scanned": len(all_bases), "n_liquid": len(liquid),
+            "n_b_new": merge["added"], "stage": stage_cnt}
+    return init, bases, index_ctx, info
+
+
+# =========================
+# 法人檔 institutional.json（baseline 傍晚算；radar 隔天盤前讀）
+# =========================
+def build_inst_table(inst_by_day: dict, days: list) -> dict:
+    """{代號: {"m": 市場, "f": [外資近 N 日], "t": [投信近 N 日]}}（張；最舊→最新；該市場那天沒有表 = None；有表但這檔不在表中 = 0）。"""
+    keys = [d.isoformat() for d in days]
+    out = {}
+    for mk in ("tse", "otc"):
+        codes = set()
+        for k in keys:
+            tbl = (inst_by_day.get(k) or {}).get(mk)
+            if tbl:
+                codes |= set(tbl)
+        for code in codes:
+            f, t = [], []
+            for k in keys:
+                tbl = (inst_by_day.get(k) or {}).get(mk)
+                if tbl is None:
+                    f.append(None)
+                    t.append(None)
+                else:
+                    fv, tv = tbl.get(code, (0.0, 0.0))
+                    f.append(round(fv / 1000.0, 1))
+                    t.append(round(tv / 1000.0, 1))
+            out[code] = {"m": mk, "f": f, "t": t}
+    return out
+
+
+def save_institutional(obj: dict) -> None:
+    atomic_write_json(INST_FILE, obj)
+
+
+def load_institutional():
+    """回傳 (法人檔 或 None, 說明)。"""
+    if not INST_FILE.exists():
+        return None, "找不到 institutional.json（baseline 還沒跑過？）"
+    try:
+        data = json.loads(INST_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"institutional.json 讀取失敗（{type(exc).__name__}）"
+    if data.get("rule") != INST_RULE:
+        return None, f"institutional.json 規則版本不符（{data.get('rule')}）"
+    m = data.get("meta") or {}
+    return data, f"T 日 {m.get('t_date')}｜上市 {'✅' if m.get('tse_ok') else '❌'} 上櫃 {'✅' if m.get('otc_ok') else '❌'}｜{len(data.get('codes') or {})} 檔"
+
+
+def _fill_inst(d: dict, rec: dict) -> None:
+    f, t = rec["f"], rec["t"]
+    d["inst5_f"], d["inst5_t"] = f, t
+    d["inst5"] = [None if (x is None or y is None) else round(x + y, 1) for x, y in zip(f, t)]
+    d["inst_t"] = d["inst5"][-1] if d["inst5"] else None
+
+
+def apply_institutional(init: dict, pools: dict, inst) -> str:
+    """把 baseline 傍晚算好的外資 / 投信近 5 日買賣超貼到夜間資料（A1 通知的法人燈號、A2 / B 的法人行都靠這個）。回傳警告（沒問題回傳空字串）。
+    法人檔的 T 日不是基準日就不貼（避免把「前一日」標成錯的日期）；沒有法人檔就保留 initial_pools.json 裡原有的（舊版 baseline 寫進去的）。"""
+    have_old = any(b.get("inst5_f") for b in list((init.get("stock_bases") or {}).values())[:20])
+    if not inst:
+        return "" if have_old else "尚無法人檔（institutional.json），A1 通知不顯示法人燈號"
+    base_date = init["metadata"]["baseline_date"]
+    t_date = (inst.get("meta") or {}).get("t_date")
+    if t_date != base_date:
+        return f"法人檔 T 日 {t_date} ≠ 基準日 {base_date}（昨晚 baseline 可能沒跑成功），今天不貼法人資料"
+    codes = inst.get("codes") or {}
+    for code, b in (init.get("stock_bases") or {}).items():
+        if code in codes:
+            _fill_inst(b, codes[code])
+    for code, e in (init.get("B_candidates") or {}).items():
+        if code in codes:
+            _fill_inst(e, codes[code])
+    for code, e in (pools.get("b") or {}).items():
+        if code in codes:
+            _fill_inst(e, codes[code])
+    return ""
 
 
 # =========================
@@ -2143,6 +2452,11 @@ def index_regime_snapshot(feed, asof: date_cls) -> dict:
             print(f"[指數] {label} 日 K 失敗：{type(exc).__name__}: {exc}", flush=True)
             continue
         hist = [(d, v) for d, v in rows if d <= asof]
+        if hist and hist[-1][0] < asof:                    # 富邦歷史日 K 盤後 16:30 才更新：13:35 收盤後選池時還沒有基準日當天 → 用即時指數（此時已是收盤價）補上
+            live = feed.index_price(mk)
+            if live and abs(live / hist[-1][1] - 1) <= 0.25:
+                print(f"[指數] {label} 歷史日 K 最後一天是 {hist[-1][0]}，基準日 {asof} 用即時指數 {live:,.2f} 補上", flush=True)
+                hist.append((asof, float(live)))
         if len(hist) < 19:
             print(f"[指數] {label} 歷史不足 19 日（{len(hist)}），略過", flush=True)
             continue
@@ -2518,6 +2832,85 @@ def build_close_report(day_str: str, regime, a_rows: list, b_rows: list, unsettl
     return "\n\n".join("\n".join(sec) for sec in sections)
 
 
+# ---------- 盤後運算（v70：收盤後選池完成才發，一則）----------
+def _night_base_of(code, bases, init):
+    return bases.get(code) or (init.get("stock_bases") or {}).get(code) or {}
+
+
+def _night_a_rows(entries: dict, bases: dict, init: dict, pools: dict) -> list:
+    """A1 追蹤 / A2 池 → 盤後總結同款的列（共用 _close_a1_lines / _close_a2_lines，文字一致）。
+    剩餘天數 = A_TRACK_DAYS - 納入後已過的交易日（追蹤日曆已含基準日）；排序依收盤距 MA10。"""
+    rows = []
+    for code, e in entries.items():
+        b = _night_base_of(code, bases, init)
+        yc, ma10 = b.get("yest_close"), b.get("true_ma10")
+        age = days_since(pools, e["entry_date"], inclusive=False)
+        rows.append({"code": code, "name": e.get("name", code), "entry_date": e.get("entry_date"),
+                     "days_left": max(0, A_TRACK_DAYS - age), "pullback_days": int(e.get("pullback_days") or 0),
+                     "gap_ma10": ((yc / ma10 - 1) * 100.0) if (yc and ma10) else 0.0})
+    return rows
+
+
+def _night_b_lines(bc: dict, bases: dict, init: dict, pools: dict) -> list:
+    """B 池：一檔一行。「明天第 N/5 天」= B 訊號日後第幾個交易日（追蹤日曆已含基準日，所以 +1）；收 = 基準日收盤。"""
+    def off_of(e):
+        return days_since(pools, e["burst_date"], inclusive=False) + 1
+    out = [f"🔵 <b>B 池：{len(bc)} 檔</b>"]
+    items = sorted(bc.items(), key=lambda kv: (0 if kv[1].get("status") == "Watching" else 1, -off_of(kv[1]), kv[0]))
+    for code, e in items[:POOL_DETAIL_MAX]:
+        b = _night_base_of(code, bases, init)
+        low, yc = e["burst_low"], b.get("yest_close")
+        if e.get("status") == "Watching":
+            status = f"👀 明天第 {off_of(e)}/{B_WAIT_DAYS} 天"
+        else:
+            status = f"✅ 已發動 {_md(e.get('entry_date'))} @ {_p2(e.get('entry_price'))}"
+        parts = [f" • {code} {e.get('name', code)}", status, f"{_md(e['burst_date'])} 最低 {_p2(low)}",
+                 f"收 {_p2(yc)}（距 {_pc((yc / low - 1) * 100.0) if yc else '—'}）"]
+        if e.get("kd_k") is not None:
+            parts.append(f"KD {e['kd_k']:.1f}/{e['kd_d']:.1f}")
+        parts.append(f"爆量 {float(e.get('burst_ratio') or 0):.1f}x")
+        if e.get("trigger"):
+            parts.append(str(e["trigger"]))
+        out.append("｜".join(parts))
+    if len(items) > POOL_DETAIL_MAX:
+        out.append(f" …另有 {len(items) - POOL_DETAIL_MAX} 檔（完整名單見 initial_pools.json 的 B_candidates）")
+    out.append(exit_rule_b())
+    return out
+
+
+def build_night_message(init: dict, bases: dict, pools: dict, asof_str: str, index_ctx, *, market_total: int, n_scanned: int,
+                        n_liquid: int, n_b_new: int, warns=None) -> str:
+    """盤後運算（一則）：摘要（檔數＋指數今收與趨勢）→ [異常才有的 ⚠️ 注意] → A1 追蹤 → A2 池 → B 池。區塊之間空一行（太長時 send_telegram 依空行拆則）。"""
+    meta, c = init["metadata"], init["metadata"]["counts"]
+    bc = init.get("B_candidates") or {}
+    n_b_low = sum(1 for cd in bc if cd in bases and not bases[cd]["liquid"])
+    head = [f"📦 <b>【盤後運算】</b>基準日 {asof_str}，下一個交易日 {meta['trade_date']}",
+            f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張：{n_liquid:,} 檔",
+            f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
+            f"🟢 A1 追蹤 {c.get('a1_track', 0)} 檔（A1 收盤確認 {A_TRACK_DAYS} 日內，還沒拉回，不會觸發 A2）",
+            f"🟡 A2 池 {c['a2']} 檔（拉回整理 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天，明天盤中重新站回才觸發 A2）",
+            f"🔵 B 池 {c['b']} 檔（全市場，不篩 5 日均量；今晚新增 {n_b_new}｜其中 5 日均量 < {MIN_VOL5_LOTS:,} 張 {n_b_low} 檔）"]
+    for v in (index_ctx or {}).values():
+        icon = "🔴 BEAR" if v.get("init_state") == "BEAR" else "🟢 NORMAL"
+        head.append(f"🌡️ {v['name']}：今收 {v['last_close']:,.2f}｜{icon}")
+    warns = list(warns or [])
+    if not index_ctx:
+        warns.append("沒有取得指數基準，明天盤前 radar 會自己補抓")
+    elif "otc" not in index_ctx:
+        warns.append("沒有櫃買指數基準：明天上櫃個股暫用加權指數判斷趨勢")
+    matrix = init.get("volume_time_matrix") or {}
+    a2_nomx = sorted(cd for cd in (init.get("A2_tracking_pool") or {}) if cd not in matrix)
+    if a2_nomx:
+        warns.append(f"A2 池有 {len(a2_nomx)} 檔沒有分時量矩陣，盤中不會觸發 A2：{'、'.join(a2_nomx[:10])}{'…' if len(a2_nomx) > 10 else ''}")
+    sections = [head]
+    if warns:
+        sections.append(["⚠️ <b>注意</b>"] + [f" • {w}" for w in warns])
+    sections.append(_close_a1_lines(_night_a_rows(init.get("A1_tracking_pool") or {}, bases, init, pools), hint="initial_pools.json"))
+    sections.append(_close_a2_lines(_night_a_rows(init.get("A2_tracking_pool") or {}, bases, init, pools), hint="initial_pools.json"))
+    sections.append(_night_b_lines(bc, bases, init, pools))
+    return "\n\n".join("\n".join(sec) for sec in sections)
+
+
 # ---------- 盤前 ----------
 def regime_lines(regime, compact: bool = False) -> list:
     if regime is None or not regime.w:
@@ -2578,7 +2971,7 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
          f"⏱ {started} ｜ 基準：{meta.get('baseline_date')}",
          "🔌<b>資料來源</b>",
          f"   • 富邦 Neo API (每 {POLL_INTERVAL} 秒)",
-         "   • 歷史：夜間預算（盤中不抓歷史）",
+         "   • 歷史：昨日收盤後預算（盤中不抓歷史）",
          "   • 法人：證交所及櫃買市場"],
     ]
     warn = [ln for ln in str(check_note or "").splitlines() if "⚠️" in ln or "失敗" in ln]     # 自檢正常時不顯示，異常才提醒
@@ -2943,7 +3336,9 @@ def close_events(pools: dict, res: dict, init: dict, regime) -> dict:
             "regime_switches": sum(w.switches for w in regime.w.values()) if regime else 0}
 
 
-async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regime=None, init: dict = None) -> bool:
+async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regime=None, init: dict = None, defer_summary: bool = False) -> dict:
+    """13:35 收盤結算。回傳 {"ok": 這次有結算, "why": 沒結算的原因（snapshot / not_trading_day / already_settled）, "snap": 最後一份快照, "report": 盤後總結文字, "res": 結算結果}。
+    defer_summary = True 時不發盤後總結（收盤後選池成功才發【盤後運算】，失敗才補發總結）。"""
     today_str = today.strftime("%Y-%m-%d")
     needed = set(pools["a"]) | set(pools["b"]) | set(pools.get("a1_pending") or {})
     deadline = datetime(today.year, today.month, today.day, SETTLE_DEADLINE[0], SETTLE_DEADLINE[1], tzinfo=TW_TZ)
@@ -2959,18 +3354,18 @@ async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regim
                 await asyncio.sleep(20)
         if snap is None:
             await loop.run_in_executor(None, send_telegram, "❌ <b>【飆股雷達】</b> 收盤結算失敗：抓不到最終快照，請手動確認。")
-            return False
+            return {"ok": False, "why": "snapshot", "snap": None}
         if first:
             first = False
             dates = {str(m.get("date", "")).replace("-", "") for m in snap["meta"].values()}
             if today_str.replace("-", "") not in dates:
                 print(f"[收盤結算] 快照日期 {dates} 不是今天 {today_str}，視為非交易日，不發盤後報告", flush=True)
-                return False
+                return {"ok": False, "why": "not_trading_day", "snap": snap}
             if not any("isTrial" in r for r in snap["rows"].values()):
                 print("[收盤結算] ⚠️ 快照列沒有 isTrial 欄位：無法判斷是否為試撮，只靠 closePrice 是否有值（暫緩收盤個股可能誤用試撮價，請確認富邦回傳欄位）", flush=True)
             if pools.get("asof") == today_str:
                 print(f"[收盤結算] 追蹤清單已在 {today_str} 結算過，不重複處理（避免追蹤天數被重複計算）", flush=True)
-                return False
+                return {"ok": False, "why": "already_settled", "snap": snap}
         for code in needed - set(closes):
             info, why = close_info_from_row(snap["rows"].get(code))
             if info:
@@ -2994,17 +3389,84 @@ async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regim
     save_pools(pools)
     ev = close_events(pools, res, init, regime)
     print(f"[收盤結算] A1 追蹤＋A2 池 {len(res['a_rows'])} 檔、B 池 {len(res['b_rows'])} 檔｜今日 {ev}｜未取得收盤價 {res['unsettled']}", flush=True)
-    msgs = [build_close_report(today_str, regime, res["a_rows"], res["b_rows"], res["unsettled"])]      # 盤後只發這一則總結（不再發「移出」「A1 收盤未確認」事件訊息）
-    for i, m in enumerate(msgs):
-        if i:
-            await asyncio.sleep(1.0)
-        await loop.run_in_executor(None, send_telegram, m)
+    report = build_close_report(today_str, regime, res["a_rows"], res["b_rows"], res["unsettled"])
+    if not defer_summary:                                    # 盤後只發這一則總結（不再發「移出」「A1 收盤未確認」事件訊息）
+        await loop.run_in_executor(None, send_telegram, report)
     today_closed = [r for r in pools["closed"] if r["date"] == today_str]
     csv_path = export_pool_csv(today_str, build_pool_rows(res["a_rows"], res["b_rows"], today_closed, res["unsettled"]))
     await loop.run_in_executor(None, send_telegram_document, csv_path,
                                f"🧾 追蹤清單明細（資料基準日 {today_str}）：A1 追蹤 {sum(1 for r in res['a_rows'] if r.get('stage') != 'A2')}｜A2 池 {sum(1 for r in res['a_rows'] if r.get('stage') == 'A2')}｜B 池 {len(res['b_rows'])}｜今日移出 {len(today_closed)}")
     save_states()
-    return True
+    return {"ok": True, "why": "", "snap": snap, "report": report, "res": res}
+
+
+async def run_scan(feed, loop, today: date_cls, pools: dict, prefetch, snap_hint) -> bool:
+    """收盤後選池：用背景預抓的歷史日 K ＋ 最終快照合成的今天 K 棒，算明天的 A1 / A2 / B 池，寫 initial_pools.json，成功後發【盤後運算】。
+    沒有預抓（13:25 後才啟動 / 預抓啟動失敗）就現場抓（約 46 分鐘）。失敗會發警告，回傳 False（stock_states 不標 COMPLETED，可手動重跑）。"""
+    today_str = today.strftime("%Y-%m-%d")
+    t0 = time.time()
+    try:
+        if prefetch is None:
+            if snap_hint is None:
+                raise ScanError("沒有快照可以決定要抓哪些股票")
+            prefetch = MarketPrefetch(feed, build_universe(snap_hint, pools), today - timedelta(days=LOOKBACK_CALENDAR_DAYS), today)
+            print("[選池] 沒有背景預抓，現場抓全市場日 K 與 1 分 K（約 46 分鐘）", flush=True)
+            await loop.run_in_executor(None, prefetch.run_blocking)
+        else:
+            if not await loop.run_in_executor(None, prefetch.wait_hist, SCAN_WAIT_PREFETCH_SEC):
+                print("[選池] 背景預抓的日 K 逾時還沒做完，用已抓到的部分", flush=True)
+            if not await loop.run_in_executor(None, prefetch.wait_all, SCAN_WAIT_CURVES_SEC):
+                print("[選池] 1 分 K 預抓逾時，其餘現場補抓", flush=True)
+            prefetch.stop.set()
+        got, want = prefetch.coverage()
+        if not want or got / want < FETCH_MIN_COVERAGE:
+            raise ScanError(f"歷史日 K 只預抓到 {got}/{want} 檔（失敗 {prefetch.fail}）" + (f"；{prefetch.error}" if prefetch.error else ""))
+        snap = await loop.run_in_executor(None, feed.snapshot_all)                  # 重抓一次最終快照（13:35 之後暫緩收盤的股票也有收盤價了）
+        dates = {str(m.get("date", "")).replace("-", "") for m in snap["meta"].values()}
+        if today_str.replace("-", "") not in dates:
+            raise ScanError(f"快照日期 {sorted(dates)} 不是今天")
+        bars = bars_from_snapshot(snap, today)
+        warns = []
+        unit_note = unit_sanity(feed, prefetch.series, bars, today)
+        if unit_note:
+            warns.append(unit_note)
+        n_merged = merge_today_bar(prefetch.series, bars, today)
+        if len(bars) < 0.9 * len(snap["rows"]):
+            warns.append(f"只有 {len(bars)}/{len(snap['rows'])} 檔有今天的最終價（暫緩收盤 / 停牌的今晚不納入選池）")
+        print(f"[選池] 今天 K 棒 {len(bars)} 檔（接上歷史 {n_merged} 檔）｜預抓日 K {got}/{want} 檔、1 分 K {len(prefetch.curves)} 檔", flush=True)
+        curves_cache = dict(prefetch.curves)
+        init, bases, index_ctx, info = await loop.run_in_executor(None, functools.partial(
+            scan_core, feed, today, prefetch.series, prefetch.universe, pools, industry=prefetch.industry, curves_cache=curves_cache,
+            snap=snap, notes=[f"收盤後選池（今天 K 棒由 13:35 後最終快照合成）｜預抓日 K {got}/{want}"], ic_budget=SCAN_IC_BUDGET_SECONDS))
+        if UNRELIABLE_MARKETS:
+            warns.append(f"{'、'.join('上市' if m == 'tse' else '上櫃' for m in sorted(UNRELIABLE_MARKETS))}日 K 資料不完整，該市場今晚不納入選池")
+        text = build_night_message(init, bases, pools, today_str, index_ctx, market_total=info["market_total"], n_scanned=info["n_scanned"],
+                                   n_liquid=info["n_liquid"], n_b_new=info["n_b_new"], warns=warns)
+        await loop.run_in_executor(None, send_telegram, text)
+        print(f"[選池] 完成，耗時 {(time.time() - t0) / 60:.1f} 分鐘", flush=True)
+        return True
+    except ScanError as exc:
+        reason = str(exc)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+    print(f"[選池] 失敗：{reason}", flush=True)
+    await loop.run_in_executor(None, send_telegram,
+                               f"❌ <b>【盤後運算失敗】</b>{reason}\n明天的候選池沒有更新，明天盤中不會發訊號。請今晚手動重跑 radar（daily workflow，13:35 之後；會現場抓資料約 46 分鐘），或執行補歷史（backfill_history）。")
+    return False
+
+
+async def run_post_close(bases: dict, feed, loop, today: date_cls, pools: dict, regime, init: dict, prefetch) -> bool:
+    """13:35 結算 → 收盤後選池。回傳 True = 這一天可以標 COMPLETED。"""
+    today_str = today.strftime("%Y-%m-%d")
+    cl = await run_close(bases, feed, loop, today, pools, regime, init, defer_summary=SCAN_ENABLED)
+    if cl["why"] in ("snapshot", "not_trading_day"):
+        return False
+    if not SCAN_ENABLED:
+        return cl["ok"]
+    ok = await run_scan(feed, loop, today, pools, prefetch, cl.get("snap"))
+    if not ok and cl.get("report"):
+        await loop.run_in_executor(None, send_telegram, cl["report"])        # 選池失敗：補發盤後總結，至少看得到今天結算後的池
+    return ok
 
 
 # =========================
@@ -3012,7 +3474,7 @@ async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regim
 # =========================
 async def main_async() -> None:
     print("=" * 55, flush=True)
-    print(f"飆股雷達 {RADAR_VERSION}：A1 / A2 / B｜行情富邦 Neo API｜夜間預算 initial_pools.json｜盤中只查表", flush=True)
+    print(f"飆股雷達 {RADAR_VERSION}：A1 / A2 / B｜行情富邦 Neo API｜收盤後預算 initial_pools.json｜盤中只查表", flush=True)
     print("=" * 55, flush=True)
     current = now_tw()
     print(f"[程序啟動] PID={os.getpid()}, GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID', 'LOCAL')}, "
@@ -3040,18 +3502,25 @@ async def main_async() -> None:
     init, init_note = load_initial_pools()
     print(f"[夜間資料] {init_note}", flush=True)
     if init is None:
-        send_telegram(f"❌ <b>【飆股雷達】</b> 無法載入夜間資料：{init_note}\n今天不發盤中訊號。請先確認 baseline workflow 已成功執行。")
+        send_telegram(f"❌ <b>【飆股雷達】</b> 無法載入夜間資料：{init_note}\n今天不發盤中訊號。請先確認昨天收盤後的選池已完成，或手動補跑（backfill_history）。")
         return
     baseline_date = init["metadata"]["baseline_date"]
+    if baseline_date == today_str:
+        print(f"[選池] 夜間資料的基準日就是今天（{today_str} 的收盤後選池已經完成），不需要再跑", flush=True)
+        set_run_status("COMPLETED")
+        return
     ok, why = await validate_baseline(feed, loop, today, baseline_date)
     print(f"[基準日] {why}｜{'通過' if ok else '不符'}", flush=True)
     if not ok:
         send_telegram(f"❌ <b>【飆股雷達】</b> 夜間資料的基準日不是最近交易日（{why}），今天不發盤中訊號。\n"
-                      f"請確認昨晚 baseline workflow 已成功執行並 commit 了 initial_pools.json。")
+                      f"請確認昨天 13:35 收盤後的選池已完成（Telegram 有【盤後運算】）並 commit 了 initial_pools.json。")
         return
     bases, matrix, a1_set = init["stock_bases"], init["volume_time_matrix"], set(init["A1_candidates"])
     sync_stats = sync_pools_from_initial(pools, init)
     print(f"[對齊] 夜間快照 → 追蹤清單：補進 A1 追蹤 / A2 池 {sync_stats['a_added']} 檔、B 池 {sync_stats['b_added']} 檔", flush=True)
+    inst, inst_note = load_institutional()
+    inst_warn = apply_institutional(init, pools, inst)
+    print(f"[法人檔] {inst_note}" + (f"｜⚠️ {inst_warn}" if inst_warn else "｜已貼到夜間資料"), flush=True)
     save_pools(pools)
     ctx_idx = {mk: v for mk, v in (("tse", init.get("listed_market_regime")), ("otc", init.get("otc_market_regime"))) if v and v.get("p")}
     if not ctx_idx:
@@ -3060,7 +3529,7 @@ async def main_async() -> None:
     regime = build_regime(ctx_idx, STATE.get("regime"))
     if after_close:
         print("已過收盤確認時間：直接執行收盤結算（通知紀錄取自 stock_states.json）", flush=True)
-        done = await run_close(bases, feed, loop, today, pools, regime, init)
+        done = await run_post_close(bases, feed, loop, today, pools, regime, init, None)
         if done:
             set_run_status("COMPLETED")
         return
@@ -3075,6 +3544,8 @@ async def main_async() -> None:
     print(f"[趨勢] {[(mk, w.name, '前19日合計', round(w.sum19, 2), '穿越價', round(w.p, 2), w.state) for mk, w in regime.w.items()]}", flush=True)
     late = current >= _market_open_today(current) + timedelta(minutes=EVAL_START_MINUTE)
     notes = []
+    if inst_warn:
+        notes.append(f"⚠️ {inst_warn}")
     if STATE["triggered"] or STATE["a2"] or STATE["b_confirm"]:
         notes.append(f"續跑：今日已通知 A1 {len(STATE['triggered'])}、A2 {len(STATE['a2'])}、B 確認 {len(STATE['b_confirm'])} 檔，不會重複通知")
     if any(c.get("stale") for c in ctx_idx.values()):
@@ -3085,6 +3556,7 @@ async def main_async() -> None:
         notes.append(f"⏰ 啟動時間 {current.strftime('%H:%M:%S')} 已過 13:25：今天不再發新的個股訊號，只做 13:35 收盤結算")
     startup = build_startup_message(init, init_note, regime, pools, pool_note, check_note, notes)
     await loop.run_in_executor(None, send_telegram, startup)
+    prefetch = await loop.run_in_executor(None, start_prefetch, feed, pools, today) if SCAN_ENABLED else None   # 背景預抓全市場日 K（盤中抓完，13:35 選池直接用）
     ctx = {"bases": bases, "matrix": matrix, "a1": a1_set, "pools": pools}
     fail_streak, fail_alerted, fail_started = 0, False, None
     polls = 0
@@ -3226,7 +3698,7 @@ async def main_async() -> None:
         await loop.run_in_executor(None, send_telegram, f"⚠️ <b>【飆股雷達】</b> 監控異常中止：{type(exc).__name__}: {exc}")
         raise
     save_states()
-    done = await run_close(bases, feed, loop, today, pools, regime, init)
+    done = await run_post_close(bases, feed, loop, today, pools, regime, init, prefetch)
     if done:
         set_run_status("COMPLETED")
 
