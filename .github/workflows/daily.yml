@@ -1,14 +1,24 @@
-name: 飆股雷達每日自動掃描
+name: 飆股雷達每日自動掃描（盤前載入・盤中訊號・收盤後選池）
 on:
-  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天 08:00~09:00 之間以 workflow_dispatch 觸發，
+  # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每天早上以 workflow_dispatch 觸發，
   # 也可到 Actions 頁面點「Run workflow」手動執行。實際啟動時間不固定，所有時段判斷都由 radar.py 依台北時間自己處理：
   #   09:00 前啟動 → 完成載入與自檢後等到 09:00；09:00~09:05 啟動 → 立即暖機，09:05 前不發個股訊號；
-  #   09:05 之後才啟動 → 視為延遲啟動（Telegram 警告），先暖機 2 輪再開放訊號；13:25 之後才啟動 → 只做 13:35 收盤結算。
+  #   09:05 之後才啟動 → 視為延遲啟動（Telegram 警告），先暖機 2 輪再開放訊號；13:25 之後才啟動 → 只做收盤結算＋選池（沒有背景預抓，約 46 分鐘）。
   # 程式 09:05 起每 15 秒一輪，13:24:45 後停止所有新的個股訊號；13:35 起收盤結算，暫緩收盤的個股最多等到 13:55 取得收盤價
   # （取不到的會在報表標註「未取得收盤價」，不用 lastPrice 代替）。
+  #
+  # v70 起這條 workflow 多做一件事：結算完接著「收盤後選池」，產出明天盤中要用的 initial_pools.json（原本是晚上 18:00 的 baseline 做的）。
+  #   - radar 一啟動就在背景預抓全市場日 K 與 1 分 K（約 48 分鐘），盤中就抓完；13:35 之後選池只需要幾分鐘，通常 13:50 前整個程式結束。
+  #   - 選池成功只發一則【盤後運算】（取代舊的 13:35 盤後總結＋晚上夜間運算兩次通知）；失敗才發【盤後運算失敗】＋補發盤後總結。
+  #
   # 重複觸發保護：同一交易日 stock_states.json 已標 COMPLETED 時，後續重複觸發（例如 Apps Script 重試）直接忽略；
-  # concurrency 保證同時只有一個雷達在跑（後到的排隊，前一個結束後看到 COMPLETED 就結束）。
-  # GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）：最早 08:00 啟動到 13:55 = 355 分鐘，timeout 設 358 分鐘。
+  # concurrency 保證同時只有一個雷達（或補歷史）在跑（後到的排隊，前一個結束後看到 COMPLETED 就結束）。
+  #
+  # 逾時設計：GitHub 託管 runner 單一 job 最長 6 小時（360 分鐘）。
+  #   - job 設 360（上限）；雷達這一步另設 352 分鐘：雷達卡住被砍時，後面「儲存狀態回 repo」「失敗通知」還有約 6 分鐘可以跑，
+  #     不會連已經算好的 signal_history.json / initial_pools.json 都沒存到。
+  #   - 以 Apps Script 08:00 觸發計算，雷達最晚可跑到約 13:52；正常 13:50 前就結束，但 13:55 結算期限＋選池會超過。
+  #     建議把 Apps Script 的觸發時間改到 08:30~08:50（雷達本來就等到 09:00 才開始判斷，早啟動沒有好處）。
   workflow_dispatch:
 permissions:
   contents: write
@@ -20,7 +30,7 @@ env:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 358
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +47,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
+      # 產業鏈快取：收盤後選池在這條 workflow 補查族群標籤（v70 起 baseline 不再查）
       - name: 還原產業鏈快取
         uses: actions/cache/restore@v4
         with:
@@ -47,6 +58,7 @@ jobs:
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
       - name: 執行飆股雷達
+        timeout-minutes: 352
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -67,24 +79,27 @@ jobs:
           key: ic-sector-${{ github.run_id }}
       # 要 commit 的檔案：
       #   stock_states.json    當天已通知名單、市場趨勢（NORMAL/BEAR）狀態、執行鎖（程式中斷重跑時不會重複通知；COMPLETED 後重複觸發直接忽略）
-      #   signal_history.json  追蹤清單（A1 待收盤確認 → A2 追蹤池、B 池等待日數；收盤結算後更新）
-      # initial_pools.json 是夜間 baseline 產出、盤中唯讀，這裡不 commit。
-      # push 前先 pull --rebase --autostash，並重試 3 次，避免和 baseline 工作流程的 commit 衝突。
+      #   signal_history.json  追蹤清單（A1 待收盤確認 → A1 追蹤 / A2 池、B 池等待日數；收盤結算後更新）
+      #   initial_pools.json   v70 新增：收盤後選池的結果（A1 候選池、A1 追蹤、A2 池、B 候選池、分時量矩陣、指數前 19 日收盤），隔天盤中唯讀。
+      #                        沒 commit 成功 = 明天沒有候選池 = 明天不發訊號，所以 push 失敗要讓這一步失敗（會觸發下面的失敗通知）。
+      # institutional.json 是傍晚 baseline 產出、radar 只讀，這裡不 commit。
+      # push 前先 pull --rebase --autostash，並重試 3 次，避免和其他 workflow 的 commit 衝突；3 次都失敗才算失敗。
       - name: 儲存狀態回 repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in stock_states.json signal_history.json; do
+          for f in stock_states.json signal_history.json initial_pools.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
           git commit -m "更新飆股雷達狀態 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
+            git pull --rebase --autostash && git push && exit 0
             echo "push 第 $i 次失敗，5 秒後重試"
             sleep 5
-          done || true
+          done
+          exit 1
       # pool_report.csv：收盤結算後的追蹤清單明細（標題列寫明資料基準日；也會傳到 Telegram）
       - name: 上傳 CSV
         if: always()
@@ -95,6 +110,7 @@ jobs:
             pool_report.csv
             signal_history.json
             stock_states.json
+            initial_pools.json
           if-no-files-found: ignore
       # 任何一步失敗、逾時或被取消，都發 Telegram（Secrets 沒設定時只略過，不影響結果）
       - name: 失敗通知
