@@ -1,19 +1,21 @@
-name: 夜間運算（日K・分時量矩陣・法人・A1/A2/B 候選池）
+name: 法人資料（外資・投信近 5 日買賣超）
 on:
   # 不設定排程（不使用 schedule/cron）。只由 Google Apps Script 的時間驅動觸發器在每個交易日傍晚（18:00 之後）以 workflow_dispatch 觸發，
   # 也可到 Actions 頁面點「Run workflow」手動執行。
-  # v69 產出兩個檔案，一起 commit 回 repo：
-  #   initial_pools.json   隔日盤中唯一使用的靜態資料（A1 候選池、A2 追蹤池、B 候選池、分時量矩陣 volume_time_matrix、
-  #                        兩個市場的前 19 日指數收盤、法人參考、候選股的均線 / 均量基底）。原子寫入，資料不完整時不覆寫前一版。
-  #   signal_history.json  追蹤清單（A1 收盤確認 → A2 追蹤池、B 池等待日數）。radar 13:35 沒結算成功時，這裡用官方日 K 補結算。
-  # 耗時：日 K 約 13 分鐘；1 分 K 只抓候選股（約 3～10 分鐘；若富邦一次回傳不完整，程式會自動改成 5 日一段，約 4 倍）；
-  #       官方法人 T 日資料還沒出來時最多再等 4 × 3 分鐘。以上都是依限速推估，第一次執行請看實際耗時。
-  # 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json 時，重複觸發（例如 Apps Script 重試）會直接結束；
-  #               要強制重跑，手動執行時勾選 force。
+  # 檔名維持 baseline.yml，Apps Script 不用改（workflow 的顯示名稱改了沒關係）。
+  #
+  # v70 起這條 workflow 只做一件事：抓證交所（T86）＋櫃買的官方三大法人買賣超，算出外資、投信近 5 個交易日淨買賣超，
+  # 寫成 institutional.json 並 commit 回 repo；隔天早上 radar 盤前讀取，貼到 A1 通知的法人燈號。
+  # A1 / A2 / B 選池、分時量矩陣、指數基準、產業鏈都已經搬到 radar（收盤後 13:35 起），這裡不再做。
+  # 為什麼法人要等傍晚：官方日報傍晚才公布，收盤後 13:35 還拿不到。
+  #
+  # 耗時：通常 1～2 分鐘；官方 T 日資料還沒出來時，每個市場最多再等 4 × 3 分鐘（INST_RETRIES × INST_RETRY_WAIT），所以上限約 25 分鐘。
+  # 重複觸發保護：institutional.json 已經是這個交易日（T 日）而且上市、上櫃都取得時，重複觸發（例如 Apps Script 重試）會直接結束；
+  #               要強制重跑（例如第一次時官方資料還沒出來、有 ❌），手動執行時勾選 force。
   workflow_dispatch:
     inputs:
       force:
-        description: "強制重跑（忽略「今天已成功產出」的重複觸發保護）"
+        description: "強制重跑（忽略「institutional.json 已經是今天」的重複觸發保護）"
         required: false
         default: false
         type: boolean
@@ -27,7 +29,7 @@ env:
 jobs:
   baseline:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +37,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # baseline 仍要登入富邦：查最近交易日、官方法人抓不到時用 institutional_trades 補 B 池標的
       - name: 檢查 SDK 檔案
         run: |
           ls -la vendor/
@@ -44,16 +47,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
-      - name: 還原產業鏈快取
-        uses: actions/cache/restore@v4
-        with:
-          path: ic_sector_cache.json
-          key: ic-sector-${{ github.run_id }}
-          restore-keys: |
-            ic-sector-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
-      - name: 夜間運算
+      - name: 抓取官方法人資料
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -66,24 +62,18 @@ jobs:
       - name: 刪除憑證
         if: always()
         run: rm -f fubon.p12
-      - name: 儲存產業鏈快取
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ic_sector_cache.json
-          key: ic-sector-${{ github.run_id }}
-      # 夜間結果 commit 回 repo，隔天雷達（daily.yml）checkout 後讀取。
-      # push 前先 pull --rebase --autostash，並重試 3 次，避免和雷達的 commit 衝突；3 次都失敗才算失敗。
-      - name: 儲存夜間運算結果回 repo
+      # 只 commit institutional.json（signal_history.json、initial_pools.json 現在由 daily.yml 的 radar 負責，這裡不碰，避免互相衝突）。
+      # push 前先 pull --rebase --autostash，並重試 3 次；3 次都失敗才算失敗。
+      - name: 儲存法人資料回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in initial_pools.json signal_history.json; do
+          for f in institutional.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
-          git commit -m "更新夜間運算 $(date '+%Y-%m-%d')"
+          git commit -m "更新法人資料 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && exit 0
             echo "push 第 $i 次失敗，5 秒後重試"
