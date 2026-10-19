@@ -1,23 +1,31 @@
-name: 一次性補歷史（B 池與 A2 追蹤池）
+name: 一次性補歷史（A1 追蹤 / A2 池 / B 池，並直接選池）
 on:
   # 上線時只跑一次，手動到 Actions 頁面點「Run workflow」。不使用 schedule，也不需要 Apps Script 觸發。
-  # 跑完會把 signal_history.json 與 backfill_report.csv commit 回 repo；接著請手動跑一次 baseline（勾 force）。
+  # v3 做的事：用富邦日 K 往回重播最近 10 個交易日 → 補好 signal_history.json（A1 追蹤、A2 池、B 池，含拉回天數與階段）
+  #            → 接著做一次「收盤後選池」，直接產生明天要用的 initial_pools.json（不用再手動跑 baseline）。
+  # 跑完會把 signal_history.json、initial_pools.json、backfill_report.csv 一起 commit 回 repo。
+  #
+  # 什麼時候跑：
+  #   - 13:35 之後最好（收盤後）：富邦歷史日 K 16:30 才有今天，程式會用 13:35 後的最終快照合成今天的 K 棒，結果是「今天收盤後」的選池，明天可以直接用。
+  #   - 盤中或開盤前跑也可以：這時基準日是上一個交易日，選出的池給「今天」用。
+  #   - 不要和 daily.yml 同時跑：兩者都會寫 signal_history.json / initial_pools.json，所以共用同一個 concurrency 群組，會自動排隊。
+  # 耗時：全市場日 K 約 37 分鐘＋候選股 1 分 K 約 9 分鐘＋重播與選池幾分鐘，合計約 55～70 分鐘（timeout 設 120 分鐘）。
   workflow_dispatch:
     inputs:
-      all_market:
-        description: "掃全市場（約 1,900 檔、約 40 分鐘）；不勾 = 只抓成交量預篩後的約 750 檔（約 15 分鐘）"
+      force:
+        description: "signal_history.json 已有內容時仍要執行（只新增不存在的代號，不覆蓋既有資料）"
         required: false
         default: false
         type: boolean
-      force:
-        description: "signal_history.json 已有內容時仍要執行（只新增不存在的代號）"
+      no_scan:
+        description: "只補 signal_history.json，不做收盤後選池（不勾 = 補完直接產生 initial_pools.json）"
         required: false
         default: false
         type: boolean
 permissions:
   contents: write
 concurrency:
-  group: volume-baseline
+  group: feigu-radar-daily
   cancel-in-progress: false
 env:
   PYTHONUNBUFFERED: "1"
@@ -37,6 +45,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests aiohttp
           pip install vendor/fubon_neo-*.whl
+      # 選池會補查族群標籤（有 30 天快取；補查上限 60 秒，補不到的下次 radar 再補）
+      - name: 還原產業鏈快取
+        uses: actions/cache/restore@v4
+        with:
+          path: ic_sector_cache.json
+          key: ic-sector-${{ github.run_id }}
+          restore-keys: |
+            ic-sector-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
       - name: 補歷史
@@ -46,19 +62,25 @@ jobs:
           FUBON_ID: ${{ secrets.FUBON_ID }}
           FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
           FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
-          BACKFILL_ALL: ${{ github.event.inputs.all_market }}
           BACKFILL_FORCE: ${{ github.event.inputs.force }}
+          BACKFILL_NO_SCAN: ${{ github.event.inputs.no_scan }}
         run: |
           python -u backfill_history.py
       - name: 刪除憑證
         if: always()
         run: rm -f fubon.p12
+      - name: 儲存產業鏈快取
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ic_sector_cache.json
+          key: ic-sector-${{ github.run_id }}
       - name: 儲存結果回 repo
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in signal_history.json backfill_report.csv; do
+          for f in signal_history.json initial_pools.json backfill_report.csv; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
@@ -77,4 +99,23 @@ jobs:
           path: |
             backfill_report.csv
             signal_history.json
+            initial_pools.json
           if-no-files-found: ignore
+      # 補歷史失敗（含選池失敗）也發 Telegram
+      - name: 失敗通知
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "沒有設定 Telegram Secrets，略過通知"
+            exit 0
+          fi
+          TEXT=$(printf '❌ 【飆股雷達】%s 執行失敗、逾時或被取消\n時間：%s\n請查看：%s' \
+            "$WORKFLOW_NAME" "$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M')" "$RUN_URL")
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" > /dev/null || echo "Telegram 通知送出失敗"
