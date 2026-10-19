@@ -1,4 +1,4 @@
-"""飆股雷達 v69.7：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構：APP SCRIPT 雙 Workflow＋分時量矩陣預計算」最終版）。
+"""飆股雷達 v69.10：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構：APP SCRIPT 雙 Workflow＋分時量矩陣預計算」最終版）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 
 【觸發方式】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
@@ -17,8 +17,10 @@
 
 【夜間（baseline.py）→ initial_pools.json】
   A1 候選池：5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ max(昨日 MA5/10/20)；隔天盤中 A1 只掃描這批，不在盤中重新篩全市場。
-  A1 追蹤 / A2 池（v69.4 分開）：A1 收盤確認成功（盤中通知過但收盤沒站穩的不進）後先在「A1 追蹤」，最多 10 個交易日；
-  某天收盤跌破 MA5 且守住 MA10 與突破日低點 → 進「A2 池」（連續拉回 1～6 天）；站回 MA5 → 回 A1 追蹤。收盤跌破 MA10 或突破日低點 → 移出。只有 A2 池才可能觸發 A2。
+  A1 追蹤 / A2 池（v69.9）：A1 收盤確認成功（盤中通知過但收盤沒站穩的不進）後先在「A1 追蹤」。
+  A1 追蹤的 10 個交易日只是「等它拉回」的窗口：某天收盤跌破 MA5 且守住 MA10 與突破日低點 → 進「A2 池」（連續拉回 1～6 天）；
+  站回 MA5 → 回 A1 追蹤。移出條件：收盤跌破 MA10 或突破日低點（A1 追蹤、A2 池都一樣）；A2 池連續拉回超過 6 天仍沒站回 MA5 → 直接移出（不回 A1）；
+  A1 追蹤滿 10 個交易日、而且當下不在拉回（沒進 A2）→ 移出；已經在 A2 池的不受 10 天限制。只有 A2 池才可能觸發 A2。
   B 候選池（v69.2 全市場，不篩 5 日均量）：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
   volume_time_matrix：每檔候選股、開盤後每一分鐘的「歷史同期累積量佔比」全部夜間算好；盤中只查表，不碰歷史分 K。
   initial_pools.json 一律「暫存檔 → fsync → os.replace」原子寫入；資料不完整時不覆寫前一版。
@@ -30,7 +32,7 @@
       預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
-【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → A1_CLOSE_CONFIRMED 進 A2 追蹤池；A2 收盤跌破 MA10 或突破日低點移出、滿 10 日移出；
+【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → A1_CLOSE_CONFIRMED 進 A1 追蹤；A1 追蹤 / A2 池收盤跌破 MA10 或突破日低點移出、A2 拉回逾 6 日移出、A1 追蹤滿 10 日沒進 A2 移出；
   B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出（不發停損／出場通知）；寫 signal_history.json、pool_report.csv。
   18:00 後 baseline 會用官方日 K 核對當日 A1 收盤確認（close_provisional → official_reconciled）。
 【檔案】initial_pools.json（夜間產出，盤中唯讀）、signal_history.json（追蹤清單，結算後更新）、stock_states.json（當日已通知名單＋趨勢狀態＋執行鎖）、pool_report.csv
@@ -123,7 +125,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v69.7"
+RADAR_VERSION = "v69.10"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -157,9 +159,9 @@ A2_MIN_DAYS, A2_MAX_DAYS = 1, 6     # 拉回整理：連續「收盤 < MA5 且 �
 A2_VOL_RATIO = 1.2                  # 預估全日量 ≥ 整理期平均量 × 1.2
 A2_REQUIRE_VWAP = True              # 現價 > 即時 VWAP
 A2_REQUIRE_ALL_MAS = True           # False = 只要現價 > 即時 MA5（你確認過的規則）；True = 現價必須同時 > 即時 MA5、MA10、MA20（「重新站回所有均線」）
-A_TRACK_DAYS = 10                   # A1 收盤確認後追蹤 10 個交易日
+A_TRACK_DAYS = 10                   # A1 追蹤窗口：收盤確認後 10 個交易日內要進 A2（拉回），沒進就移出；已在 A2 池的不受這個限制
 # 追蹤標的的兩個階段（同一份 signal_history.json 的 "a" 區塊，用 stage 欄位區分）：
-#   stage = "A1"：A1 收盤確認後追蹤中，還沒拉回整理（或拉回已超過 A2 窗口）。這時不會觸發 A2。
+#   stage = "A1"：A1 收盤確認後追蹤中，目前沒有在拉回整理。這時不會觸發 A2。
 #   stage = "A2"：曾收盤跌破 MA5 且守住 MA10 與突破日低點，連續 A2_MIN_DAYS～A2_MAX_DAYS 個交易日 → 進 A2 池，這段期間盤中重新站回才會觸發 A2 二次加碼。
 
 # ---- B（跌深低接）----
@@ -1043,7 +1045,8 @@ def consolidation_run(dates, closes, vols_lots, after_date, floor_low=None):
 
 
 def a_stage_from_days(n) -> str:
-    """連續拉回整理天數 n → 階段。1～6 天（A2_MIN_DAYS～A2_MAX_DAYS）= "A2"（A2 池）；0 天（沒拉回）或超過 6 天 = "A1"（仍在 A1 追蹤，不會觸發 A2）。"""
+    """連續拉回整理天數 n → 階段。1～6 天（A2_MIN_DAYS～A2_MAX_DAYS）= "A2"（A2 池）；0 天（沒拉回）= "A1"（A1 追蹤，不會觸發 A2）。
+    超過 6 天不是「回 A1」，而是直接移出（pool_a_close_update / apply_a_stages 處理）；這裡對超過 6 天的舊資料仍回 "A1" 只是保險。"""
     return "A2" if (n is not None and A2_MIN_DAYS <= int(n) <= A2_MAX_DAYS) else "A1"
 
 
@@ -1064,22 +1067,31 @@ def entry_stage(e: dict) -> str:
     return a_stage_from_days(entry_pullback_days(e))
 
 
-def apply_a_stages(pools: dict, bases: dict) -> dict:
+def apply_a_stages(pools: dict, bases: dict, day_str: str = None) -> dict:
     """夜間用日 K 重算每檔追蹤標的的連續拉回整理天數（consolidation_run），寫進 a2 / pullback_days / stage / status。
-    回傳 {"a1": A1 追蹤（還沒拉回或已超過窗口）檔數, "a2": A2 池（拉回 1～6 天）檔數}。沒有日 K 的標的維持原值（舊檔案則由 entry_stage 推算）。"""
-    n_a1 = n_a2 = 0
-    for code, e in pools["a"].items():
+    連續拉回超過 A2_MAX_DAYS（6）天 → 直接移出（寫進 closed，原因「拉回逾 N 日未站回MA5」），不再退回 A1 追蹤。
+    回傳 {"a1": A1 追蹤檔數, "a2": A2 池檔數, "removed": 本次移出檔數}。沒有日 K 的標的維持原值（舊檔案則由 entry_stage 推算）。day_str = 移出紀錄的日期（預設追蹤清單結算日）。"""
+    day_str = day_str or pools.get("asof") or now_tw().strftime("%Y-%m-%d")
+    n_a1 = n_a2 = n_out = 0
+    for code, e in list(pools["a"].items()):
         a2 = (bases.get(code) or {}).get("a2")
         if a2 is not None:
             e["a2"] = a2
             e["pullback_days"] = int(a2.get("n") or 0)
+        n = entry_pullback_days(e)
+        if n > A2_MAX_DAYS:
+            pools["a"].pop(code)
+            close_record(pools, "A", code, e, day_str, f"拉回逾{A2_MAX_DAYS}日未站回MA5", e.get("last_close"), {"pullback_days": n})
+            n_out += 1
+            print(f"[A 追蹤] {code} {e.get('name', '')} 連續拉回 {n} 天（> {A2_MAX_DAYS}）→ 移出", flush=True)
+            continue
         e["stage"] = entry_stage(e)
-        e["status"] = "Pullback" if entry_pullback_days(e) >= 1 else "Active"
+        e["status"] = "Pullback" if n >= 1 else "Active"
         if e["stage"] == "A2":
             n_a2 += 1
         else:
             n_a1 += 1
-    return {"a1": n_a1, "a2": n_a2}
+    return {"a1": n_a1, "a2": n_a2, "removed": n_out}
 
 
 def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
@@ -1403,7 +1415,8 @@ def a1_confirm_settle(pools: dict, bases: dict, closes: dict, today_str: str, sk
 
 def pool_a_close_update(pools: dict, bases: dict, closes: dict, today_str: str, skip=()):
     """A1 追蹤 / A2 池收盤結算（只處理「今天以前」已確認的）。回傳 (列表列, 今日移出紀錄)。
-    收盤跌破 MA10 或跌破突破日低點 → 移出並重置該週期；確認後滿 A_TRACK_DAYS 個交易日 → 追蹤期滿移出。
+    移出：① 收盤跌破 MA10 ② 收盤跌破突破日低點 ③ 連續拉回超過 A2_MAX_DAYS（6）天仍沒站回 MA5（直接移出，不回 A1）
+         ④ 確認後滿 A_TRACK_DAYS（10）個交易日、而且當下不在拉回（= 這 10 天沒進 A2）。已經在 A2 池的不受 10 天限制。
     其餘依收盤是否跌破 MA5 更新連續拉回天數與階段：收盤 < MA5 且守住 MA10 → 進 A2 池（1～6 天），站回 MA5 → 回 A1 追蹤。"""
     rows, exits = [], []
     for code, e in list(pools["a"].items()):
@@ -1432,12 +1445,16 @@ def pool_a_close_update(pools: dict, bases: dict, closes: dict, today_str: str, 
             pools["a"].pop(code)
             exits.append(close_record(pools, "A", code, e, today_str, "收盤跌破突破日低點", close, {"floor": floor, "age": age}))
             continue
-        if age >= A_TRACK_DAYS:
-            pools["a"].pop(code)
-            exits.append(close_record(pools, "A", code, e, today_str, "追蹤期滿", close, {"age": age}))
-            continue
         # 連續拉回整理天數：今天收盤 < MA5（且上面已確認守住 MA10 與突破日低點）→ +1；站回 MA5 以上 → 歸 0
         n_pb = (entry_pullback_days(e) + 1) if close < ma5 else 0
+        if n_pb > A2_MAX_DAYS:                                      # 拉回連續超過 6 天都沒站回 MA5 → 直接移出（不回 A1 追蹤）
+            pools["a"].pop(code)
+            exits.append(close_record(pools, "A", code, e, today_str, f"拉回逾{A2_MAX_DAYS}日未站回MA5", close, {"age": age, "pullback_days": n_pb}))
+            continue
+        if age >= A_TRACK_DAYS and n_pb == 0:                       # A1 追蹤滿 10 個交易日、而且當下不在拉回（沒進 A2，或進過但已站回 MA5）→ 移出；還在 A2 池的不受這條限制
+            pools["a"].pop(code)
+            exits.append(close_record(pools, "A", code, e, today_str, f"追蹤滿{A_TRACK_DAYS}日且已不在拉回", close, {"age": age}))
+            continue
         e["pullback_days"] = n_pb
         e["stage"] = a_stage_from_days(n_pb)                        # 1～6 天 = A2 池；0 天或超過 6 天 = 仍在 A1 追蹤
         e["status"] = "Pullback" if n_pb >= 1 else "Active"
@@ -2045,7 +2062,7 @@ def fetch_inst_days(days: list, retries: int = None, wait: float = None):
 
 
 def attach_inst(bases: dict, inst_by_day: dict, days: list) -> None:
-    """把近 INST_DAYS 日「外資＋投信」合計淨買賣超（張）寫進每檔基底：inst5 = [最舊…最新]（沒有資料的日子是 None）；inst_t = T 日；inst5_f / inst5_t = 外資、投信各自的淨買賣超。
+    """把近 INST_DAYS 日「外資＋投信」合計淨買賣超（張）寫進每檔基底：inst5 = [最舊…最新]（沒有資料的日子是 None）；inst_t = T 日。
     該市場當日有表、但這檔不在表中 = 當天沒有法人進出 = 0（不是缺資料）。"""
     keys = [d.isoformat() for d in days]
     for code, b in bases.items():
@@ -2443,96 +2460,62 @@ def build_regime_message(ev: str, w, now: datetime) -> str:
             f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 門檻回到 {A1_VOL_RATIO:g} 倍｜A2 恢復開放｜B 照常")
 
 
-# ---------- 盤後 ----------
-def build_close_summary(day_str: str, market_txt: str, regime, a_rows: list, b_rows: list, ev: dict, unsettled: list) -> str:
-    lines = [f"📊 <b>【盤後總結】｜{day_str}</b>", market_txt]
-    lines += regime_lines(regime, compact=True)
-    n_a2 = sum(1 for r in a_rows if r.get("stage") == "A2")
-    n_a1 = len(a_rows) - n_a2
-    lines += ["", f"🟢 <b>A1 追蹤（A1 收盤確認後 {A_TRACK_DAYS} 日內，還沒拉回）：{n_a1} 檔</b>",
-              f"🟡 <b>A2 池（拉回整理 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天，等盤中重新站回）：{n_a2} 檔</b>",
-              f"   今日：A1 盤中通知 {ev['a1']}｜收盤確認 {ev['a1_ok']}｜未確認 {ev['a1_fail']}｜A2 加碼 {ev['a2']}｜移出 {ev['a_exit']}"]
-    nw = sum(1 for r in b_rows if r["status"] == "Watching")
-    lines += [f"🔵 <b>B 池：{len(b_rows)} 檔</b>（Watching {nw}｜Active {len(b_rows) - nw}）",
-              f"   今日：確認發動 {ev['bc']}｜防線失守 / 失效 {ev['b_break']}｜B_EXPIRED（等滿 {B_WAIT_DAYS} 日沒發動）{ev['b_expire']}｜夜間新增 {ev['b_new']}"]
-    if ev.get("regime_switches"):
-        lines.append(f"🌡️ 今日市場趨勢正式切換 {ev['regime_switches']} 次")
-    lines.append("ℹ️ 收盤價為富邦最終快照（暫定），18:00 後夜間運算會用官方日 K 核對 A1 收盤確認。")
-    if unsettled:
-        lines += ["", f"⚠️ 以下標的 {SETTLE_DEADLINE[0]}:{SETTLE_DEADLINE[1]:02d} 仍未取得收盤價（暫緩收盤或資料延遲），今日不結算：",
-                  "、".join(unsettled)]
-    return "\n".join(lines)
+# ---------- 盤後總結（v69.8：A1 追蹤 / A2 池 / B 池合併成一則）----------
+def _slash_date(day) -> str:
+    """'2026-10-16' → '2026/10/16'。"""
+    return str(day).replace("-", "/") if day else "—"
 
 
-def build_a_exit_message(day_str: str, exits: list) -> str:
-    lines = [f"🟢 <b>【A1 追蹤 / A2 池移出】</b>｜{day_str}", f"{len(exits)} 檔今日收盤後移出（只管清單，不是交易指令）："]
-    for ex in exits[:EXIT_LIST_MAX]:
-        if ex["reason"] == "收盤跌破MA10":
-            lines += ["", f"<b>{ex['code']} {ex['name']}</b>｜收 {_p2(ex['exit_price'])} < MA10 {_p2(ex.get('ma10'))}",
-                      f"   A1 確認 {_md(ex['entry_date'])} @ {_p2(ex['entry_price'])} → {_pc(ex['ret_pct'])}｜追蹤 {ex.get('age', 0)} 日"]
-        else:
-            lines += ["", f"<b>{ex['code']} {ex['name']}</b>｜{ex['reason']}｜收 {_p2(ex.get('exit_price'))}"]
-    if len(exits) > EXIT_LIST_MAX:
-        lines += ["", f"…另有 {len(exits) - EXIT_LIST_MAX} 檔（完整名單見 pool_report.csv）"]
-    return "\n".join(lines)
-
-
-def build_b_close_message(day_str: str, exits: list) -> str:
-    lines = [f"🔵 <b>【B 池移出】</b>｜{day_str}（只管清單，不發停損 / 出場通知）"]
-    for ex in exits[:EXIT_LIST_MAX]:
-        pnl = f"｜通知後 {_pc(ex['ret_pct'])}" if ex.get("ret_pct") is not None else ""
-        lines.append(f"• <b>{ex['code']} {ex['name']}</b>｜{ex['reason']}｜收 {_p2(ex.get('exit_price'))}{pnl}")
-    return "\n".join(lines)
-
-
-def _a_list_lines(rows: list, stage: str) -> list:
-    out = []
+def _close_a1_lines(rows: list, hint: str = "pool_report.csv") -> list:
+    out = [f"🟢 <b>A1 追蹤：{len(rows)} 檔</b>"]
     for r in sorted(rows, key=lambda r: r["gap_ma10"])[:LIST_MAX]:
-        n = r.get("pullback_days", 0)
-        if stage == "A2":
-            mark = f"📉 拉回第 {n} 天（A2 池，等盤中站回）"
-        elif n > 0:
-            mark = f"📉 拉回 {n} 天（已逾 {A2_MAX_DAYS} 天窗口，不再觸發 A2）"
-        else:
-            mark = "✅ 站穩均線"
-        new = " 🆕" if r["new_today"] else ""
-        prov = "（暫定）" if r.get("provisional") else ""
-        a2 = f"｜A2 {'、'.join(_md(d) for d in r['a2_dates'])}" if r["a2_dates"] else ""
-        out += ["", f"<b>{r['code']} {r['name']}</b>{new}｜{mark}｜A1 {_md(r['entry_date'])} @ {_p2(r['entry_price'])}｜收 {_p2(r['close'])}（{_pc(r['ret_pct'])}）{prov}",
-                f"   MA5 {_p2(r['ma5'])}｜MA10 {_p2(r['ma10'])}（距 {_pc(r['gap_ma10'])}）｜突破日低點 {_p2(r.get('breakout_low'))}｜剩 {r['days_left']} 日{a2}"]
+        out.append(f" • {r['code']} {r['name']}｜{_slash_date(r['entry_date'])}納入，剩 {r['days_left']} 日")
     if len(rows) > LIST_MAX:
-        out += ["", f"…另有 {len(rows) - LIST_MAX} 檔（完整名單見 pool_report.csv）"]
+        out.append(f" …另有 {len(rows) - LIST_MAX} 檔（完整名單見 {hint}）")
+    out.append(f"移出：【收盤確認{A_TRACK_DAYS}日內沒拉回】或是【收盤跌破 MA10/突破日低點】")
     return out
 
 
-def build_pool_a_list(rows: list) -> str:
-    """A1 追蹤（A1 收盤確認後還沒拉回）與 A2 池（拉回整理 1～6 天）分開列。"""
-    a2_rows = [r for r in rows if r.get("stage") == "A2"]
-    a1_rows = [r for r in rows if r.get("stage") != "A2"]
-    lines = [f"🟢 <b>【A1 追蹤】{len(a1_rows)} 檔</b>（A1 收盤確認後 {A_TRACK_DAYS} 日內，還沒拉回；收盤跌破 MA10 或突破日低點移出）"]
-    lines += _a_list_lines(a1_rows, "A1") if a1_rows else ["目前沒有標的。"]
-    lines += ["", f"🟡 <b>【A2 池】{len(a2_rows)} 檔</b>（收盤 < MA5、守住 MA10 與突破日低點，連續 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天；盤中重新站回才觸發 A2）"]
-    lines += _a_list_lines(a2_rows, "A2") if a2_rows else ["目前沒有標的。"]
-    return "\n".join(lines)
+def _close_a2_lines(rows: list, hint: str = "pool_report.csv") -> list:
+    out = [f"🟡 <b>A2 池：{len(rows)} 檔</b>"]
+    for r in sorted(rows, key=lambda r: r["gap_ma10"])[:LIST_MAX]:
+        out.append(f" • {r['code']} {r['name']}｜📉 拉回第 {r.get('pullback_days', 0)} 天｜A1 {_md(r['entry_date'])}")
+    if len(rows) > LIST_MAX:
+        out.append(f" …另有 {len(rows) - LIST_MAX} 檔（完整名單見 {hint}）")
+    out.append(f"移出：【{A2_MAX_DAYS}日未站回MA5】或是【收盤跌破 MA10/突破日低點】")
+    return out
 
 
-def build_pool_b_list(rows: list) -> str:
-    nw = sum(1 for r in rows if r["status"] == "Watching")
-    lines = [f"🔵 <b>【B 池】{len(rows)} 檔</b>（Watching {nw}｜Active {len(rows) - nw}）"]
-    if not rows:
-        return "\n".join(lines + ["目前沒有標的。"])
+def exit_rule_b() -> str:
+    """B 池的移出說明（盤後總結、夜間運算共用，文字只維護這一處）。"""
+    return f"移出：【{B_WAIT_DAYS}日未站上 MA5/VWAP】或是【跌破最低點】"
+
+
+def _close_b_lines(rows: list) -> list:
+    out = [f"🔵 <b>B 池：{len(rows)} 檔</b>"]
     for r in sorted(rows, key=lambda r: r["gap_low"])[:LIST_MAX]:
-        new = " 🆕" if r["new_today"] else ""
         kd = f"KD {r['kd_k']:.1f}/{r['kd_d']:.1f}｜" if r.get("kd_k") is not None else ""
         if r["status"] == "Watching":
-            lines += ["", f"<b>{r['code']} {r['name']}</b>{new}｜👀 等待 {r['waiting_days']}/{B_WAIT_DAYS} 天｜B 訊號日 {_md(r['burst_date'])} 最低 {_p2(r['burst_low'])}｜收 {_p2(r['close'])}（距 {_pc(r['gap_low'])}）",
-                      f"   {kd}爆量 {r['burst_ratio']:.1f}x｜{r.get('trigger', '')}｜剩 {r['days_left']} 天"]
+            out += [f" • {r['code']} {r['name']}｜👀 等待 {r['waiting_days']}/{B_WAIT_DAYS} 天｜{_md(r['burst_date'])} 最低 {_p2(r['burst_low'])}｜收 {_p2(r['close'])}（距 {_pc(r['gap_low'])}）",
+                    f"   {kd}爆量 {r['burst_ratio']:.1f}x｜{r.get('trigger', '')}"]
         else:
-            lines += ["", f"<b>{r['code']} {r['name']}</b>｜✅ 已發動 {_md(r['entry_date'])} @ {_p2(r['entry_price'])}（{_pc(r['ret_pct'])}）｜收 {_p2(r['close'])}",
-                      f"   B 防線 {_p2(r['burst_low'])}（距 {_pc(r['gap_low'])}）｜追蹤剩 {r['days_left']} 日"]
+            out += [f" • {r['code']} {r['name']}｜✅ 已發動 {_md(r['entry_date'])} @ {_p2(r['entry_price'])}（{_pc(r['ret_pct'])}）｜收 {_p2(r['close'])}",
+                    f"   B 防線 {_p2(r['burst_low'])}（距 {_pc(r['gap_low'])}）｜追蹤剩 {r['days_left']} 日"]
     if len(rows) > LIST_MAX:
-        lines += ["", f"…另有 {len(rows) - LIST_MAX} 檔（完整名單見 pool_report.csv）"]
-    return "\n".join(lines)
+        out.append(f" …另有 {len(rows) - LIST_MAX} 檔（完整名單見 pool_report.csv）")
+    out.append(exit_rule_b())
+    return out
+
+
+def build_close_report(day_str: str, regime, a_rows: list, b_rows: list, unsettled: list) -> str:
+    """盤後總結（一則）：市場趨勢 → A1 追蹤 → A2 池 → B 池，每區塊最後一行是移出條件。只列「現在池中有誰」，不列今天移出了誰。區塊之間空一行（太長時 send_telegram 依空行拆則）。"""
+    sections = [[f"📊 <b>【盤後總結】｜{day_str}</b>"] + regime_lines(regime, compact=True)]
+    sections.append(_close_a1_lines([r for r in a_rows if r.get("stage") != "A2"]))
+    sections.append(_close_a2_lines([r for r in a_rows if r.get("stage") == "A2"]))
+    sections.append(_close_b_lines(b_rows))
+    if unsettled:
+        sections.append([f"⚠️ 以下標的 {SETTLE_DEADLINE[0]}:{SETTLE_DEADLINE[1]:02d} 仍未取得收盤價（暫緩收盤或資料延遲），今日不結算：", "、".join(unsettled)])
+    return "\n\n".join("\n".join(sec) for sec in sections)
 
 
 # ---------- 盤前 ----------
@@ -2607,7 +2590,7 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
     sections.append([
         "📋<b>規則摘要</b>",
         "   • <b>A1 突破</b>：",
-        f"      1️⃣站上 MA5/10/20",
+        "      1️⃣站上 MA5/10/20",
         f"      2️⃣漲>{A1_CHG_MIN:g}% ＋ 紅K ＋ 現價>VWAP",
         f"      3️⃣量比≥{A1_VOL_RATIO:g} (BEAR 需量比≥{A1_VOL_RATIO_BEAR:g})",
         f"      4️⃣預估量≥{A1_MIN_EST_LOTS:,}張",
@@ -2685,28 +2668,6 @@ def export_pool_csv(day_str: str, rows: list) -> pathlib.Path:
         writer.writeheader()
         writer.writerows(rows)
     return POOL_CSV_FILE
-
-
-def market_status_info(feed, today: date_cls) -> dict:
-    """大盤 MA20 狀態（盤後摘要顯示用）。富邦加權指數日 K ＋ 即時指數。"""
-    try:
-        rows = feed.index_closes("tse", today)
-        hist = [v for d, v in rows if d < today]
-        live = feed.index_price("tse")
-        if len(hist) >= 19 and live:
-            ma20 = (sum(hist[-19:]) + live) / 20
-            return {"ok": True, "close": live, "ma20": ma20, "above": live > ma20}
-    except Exception as exc:
-        print(f"[大盤] 狀態計算失敗：{type(exc).__name__}: {exc}", flush=True)
-    return {"ok": False}
-
-
-def market_line(info: dict) -> str:
-    if not info.get("ok"):
-        return "大盤：狀態無法取得（富邦加權指數抓取失敗）"
-    if info["above"]:
-        return f"大盤：加權指數 {info['close']:,.0f}｜位於 MA20（{info['ma20']:,.0f}）之上 ✅"
-    return f"大盤：加權指數 {info['close']:,.0f}｜低於 MA20（{info['ma20']:,.0f}）⚠️"
 
 
 # =========================
@@ -3032,19 +2993,8 @@ async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regim
     res = settle_close(pools, bases, closes, today_str, skip)
     save_pools(pools)
     ev = close_events(pools, res, init, regime)
-    print(f"[收盤結算] A2 追蹤池 {len(res['a_rows'])} 檔、B 池 {len(res['b_rows'])} 檔｜今日 {ev}｜未取得收盤價 {res['unsettled']}", flush=True)
-    market_info = await loop.run_in_executor(None, market_status_info, feed, today)
-    msgs = [build_close_summary(today_str, market_line(market_info), regime, res["a_rows"], res["b_rows"], ev, res["unsettled"])]
-    if res["a1_failed"]:
-        lines = [f"🟡 <b>【A1 收盤未確認】</b>｜{today_str}", "盤中通知過 A1，但收盤沒站穩三均線 / 沒有收盤資料，不進 A2 追蹤池："]
-        for r in res["a1_failed"][:EXIT_LIST_MAX]:
-            lines.append(f"• <b>{r['code']} {r['name']}</b>｜{r['reason']}｜收 {_p2(r.get('exit_price'))}")
-        msgs.append("\n".join(lines))
-    if res["a_exits"]:
-        msgs.append(build_a_exit_message(today_str, res["a_exits"]))
-    if res["b_exits"]:
-        msgs.append(build_b_close_message(today_str, res["b_exits"]))
-    msgs += [build_pool_a_list(res["a_rows"]), build_pool_b_list(res["b_rows"])]
+    print(f"[收盤結算] A1 追蹤＋A2 池 {len(res['a_rows'])} 檔、B 池 {len(res['b_rows'])} 檔｜今日 {ev}｜未取得收盤價 {res['unsettled']}", flush=True)
+    msgs = [build_close_report(today_str, regime, res["a_rows"], res["b_rows"], res["unsettled"])]      # 盤後只發這一則總結（不再發「移出」「A1 收盤未確認」事件訊息）
     for i, m in enumerate(msgs):
         if i:
             await asyncio.sleep(1.0)
@@ -3052,7 +3002,7 @@ async def run_close(bases: dict, feed, loop, today: date_cls, pools: dict, regim
     today_closed = [r for r in pools["closed"] if r["date"] == today_str]
     csv_path = export_pool_csv(today_str, build_pool_rows(res["a_rows"], res["b_rows"], today_closed, res["unsettled"]))
     await loop.run_in_executor(None, send_telegram_document, csv_path,
-                               f"🧾 追蹤清單明細（資料基準日 {today_str}）：A2 追蹤池 {len(res['a_rows'])}｜B 池 {len(res['b_rows'])}｜今日移出 {len(today_closed)}")
+                               f"🧾 追蹤清單明細（資料基準日 {today_str}）：A1 追蹤 {sum(1 for r in res['a_rows'] if r.get('stage') != 'A2')}｜A2 池 {sum(1 for r in res['a_rows'] if r.get('stage') == 'A2')}｜B 池 {len(res['b_rows'])}｜今日移出 {len(today_closed)}")
     save_states()
     return True
 
