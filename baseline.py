@@ -1,4 +1,4 @@
-"""夜間運算 baseline.py（v69.5）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
+"""夜間運算 baseline.py（v69.7）：每個交易日盤後執行，產出明天 radar.py 盤中唯一使用的靜態資料 initial_pools.json，並更新追蹤清單 signal_history.json。
 價格與成交量全部來自富邦 Neo API；法人用官方資料（外資＋投信，只當參考）。建議 18:00 之後由 Google Apps Script 呼叫 baseline.yml（workflow_dispatch）觸發。
 流程：
   0. 重複觸發保護：今天已經成功產出同一基準日的 initial_pools.json → 直接結束（要強制重跑：workflow 手動執行時勾選 force，或環境變數 FORCE=1）
@@ -21,7 +21,9 @@
      第 2 則 = 【A2 池 / B 池明細】：逐檔列出明天要盯的標的與「明天盤中觸發 / 確認需要達到的價位與量能」
         A2 池：拉回第幾天、A1 確認日與價、突破日低點、明天現價需站上多少才算站上即時 MA5、整理期均量與預估量門檻
         B 池：明天是等待期第幾天（最多 5 天）、B 訊號日防線、昨收距防線 %、KD、爆量倍數、明天確認需要的條件（含量縮上限）、有沒有分時量矩陣
-需要同資料夾的 radar.py（v69.4：夜間／盤中共用函式都在那裡；本檔只用到 radar.py 已有的函式與常數）。
+  10. 法人（v69.7）：除了「外資＋投信合計」inst5，另外保存外資 inst5_f、投信 inst5_t 各自近 5 日買賣超（張）寫進 stock_bases；
+      盤中 A1 通知用它們顯示外資、投信各一行紅綠燈。這個拆分寫在 radar.py 的 attach_inst，本檔不需要額外程式碼。
+需要同資料夾的 radar.py（v69.7：夜間／盤中共用函式都在那裡；本檔只用到 radar.py 已有的函式與常數）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
@@ -243,7 +245,7 @@ def already_done(feed):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("夜間運算 baseline.py v69.5（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
+    print("夜間運算 baseline.py v69.7（富邦全市場日 K / 候選股 1 分 K ＋ 官方法人 → initial_pools.json ＋ signal_history.json）", flush=True)
     print("=" * 55, flush=True)
     if not rd.B_FULL_MARKET:
         print("⚠️ rd.B_FULL_MARKET = False：夜間日 K 只抓快照成交量預篩後的股票，B 池不是全市場", flush=True)
@@ -370,7 +372,7 @@ def main() -> int:
     b_codes = sorted(init["B_candidates"])
     n_b_low = sum(1 for cd in b_codes if cd in bases and not bases[cd]["liquid"])
     b_nomx = [cd for cd in b_codes if cd not in init["volume_time_matrix"]]
-    lines = [f"📦 <b>【夜間運算 v69.5】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
+    lines = [f"📦 <b>【夜間運算 v69.7】</b> initial_pools.json 已更新（基準日 {asof_str}，下一個交易日 {meta['trade_date']}）",
              f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜達標（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張）{len(liquid):,} 檔",
              f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {rd.MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
              f"🟢 A1 追蹤 {c.get('a1_track', 0)} 檔（A1 收盤確認 {rd.A_TRACK_DAYS} 日內，還沒拉回，不會觸發 A2）",
