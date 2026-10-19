@@ -375,7 +375,8 @@ def main() -> int:
         industry = {}
     try:
         init, bases, index_ctx, info = rd.scan_core(feed, asof, series, universe, pools, industry=industry, snap=snap,
-                                                    notes=["補歷史後選池"], ic_budget=rd.SCAN_IC_BUDGET_SECONDS)
+                                                    notes=["補歷史後選池"], ic_budget=rd.SCAN_IC_BUDGET_SECONDS,
+                                                    max_new_curves=None)         # 補歷史沒有背景預抓：所有候選股的 1 分 K 都要現場抓（約 9 分鐘），不能套 150 檔上限
     except rd.ScanError as exc:
         rd.send_telegram(f"❌ <b>【補歷史】選池失敗</b>：{exc}。signal_history.json 已補好，請稍後重跑一次（BACKFILL_FORCE=1 只會新增不存在的代號）。")
         return 1
