@@ -1,6 +1,7 @@
-"""一次性補歷史 backfill_history.py（v5.2）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
+"""一次性補歷史 backfill_history.py（v5.3）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
 並把每一次 A2 觸發（二次加碼）也重播出來寫進報表；最後順便做一次「收盤後選池」，直接產生明天要用的 initial_pools.json。
 這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.2）。跑完不需要再跑。
+v5.3：B 重播跟著 radar v70.5（B_MIN_TURNOVER = 15 億，爆量日成交額不足的不計入 B 訊號）；A1 / A2 邏輯不變。
 v5.2：重複執行（BACKFILL_FORCE=1）不再把同一批「補歷史」移出紀錄一直累加進 closed（radar.save_pools 會依 池／代號／日期／原因／進場日 去重，並順手清掉舊檔裡已經累積的重複）。
 v5.1 新增「只重跑選池」模式（BACKFILL_RESCAN_ONLY=1，workflow 勾 rescan_only）：
   不重播、不補任何標的、不碰追蹤清單的內容；只用「現在的 signal_history.json」重新做一次收盤後選池，覆寫 initial_pools.json。
@@ -222,7 +223,7 @@ def replay_a2_triggers(series: dict, cal: list, a_all: list):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("一次性補歷史 backfill_history.py v5.2（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
+    print("一次性補歷史 backfill_history.py v5.3（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
     print("=" * 55, flush=True)
     force = _truthy("BACKFILL_FORCE")
     do_scan = not _truthy("BACKFILL_NO_SCAN")
