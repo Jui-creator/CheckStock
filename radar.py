@@ -1,4 +1,4 @@
-"""飆股雷達 v70.3：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
+"""飆股雷達 v70.4：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
   08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
@@ -122,7 +122,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v70.3"
+RADAR_VERSION = "v70.4"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -1319,6 +1319,24 @@ def new_pools() -> dict:
     return {"rule": POOL_RULE, "asof": "", "updated": "", "days": [], "a1_pending": {}, "a": {}, "b": {}, "closed": []}
 
 
+def _closed_key(r: dict):
+    return (r.get("pool"), r.get("code"), r.get("date"), str(r.get("reason", "")).replace("（補歷史）", ""), r.get("entry_date") or r.get("burst_date") or "")
+
+
+def dedupe_closed(closed: list) -> list:
+    """移出紀錄去重：同一池／代號／移出日／原因／進場日只留一筆。補歷史（backfill_history）重跑時會把同一批「（補歷史）」推估的移出紀錄一再累加，
+    也會和 radar 當天真實結算的紀錄重複；真實結算的優先於「（補歷史）」推估的。維持原本的時間順序。"""
+    out, pos = [], {}
+    for r in closed or []:
+        k = _closed_key(r)
+        if k not in pos:
+            pos[k] = len(out)
+            out.append(r)
+        elif "（補歷史）" in str(out[pos[k]].get("reason", "")) and "（補歷史）" not in str(r.get("reason", "")):
+            out[pos[k]] = r
+    return out
+
+
 def load_pools():
     """回傳 (pools, 說明)。檔案不存在 / 規則版本不認得 → 空股池 + 說明。q1 會自動升級成 q2。"""
     if not POOL_FILE.exists():
@@ -1332,7 +1350,7 @@ def load_pools():
     pools = new_pools()
     pools.update({"asof": data.get("asof", ""), "updated": data.get("updated", ""), "days": list(data.get("days") or []),
                   "a1_pending": dict(data.get("a1_pending") or {}), "a": dict(data.get("a") or {}),
-                  "b": dict(data.get("b") or {}), "closed": list(data.get("closed") or [])})
+                  "b": dict(data.get("b") or {}), "closed": dedupe_closed(list(data.get("closed") or []))})
     upgraded = ""
     if data.get("rule") == "q1":
         for e in pools["a"].values():
@@ -1345,7 +1363,7 @@ def load_pools():
 def save_pools(pools: dict) -> None:
     pools["rule"] = POOL_RULE
     pools["days"] = sorted(set(pools.get("days") or []))[-DAYS_KEEP:]
-    pools["closed"] = (pools.get("closed") or [])[-CLOSED_KEEP:]
+    pools["closed"] = dedupe_closed(pools.get("closed") or [])[-CLOSED_KEEP:]
     pools["updated"] = now_tw().isoformat(timespec="seconds")
     atomic_write_json(POOL_FILE, pools)
 
@@ -2589,7 +2607,7 @@ def reconcile_a1_confirm(pools: dict, bases: dict, asof_str: str) -> dict:
 
 def assemble_initial_pools(bases: dict, pools: dict, asof_iso: str, index_ctx: dict, inst_meta: dict, matrix: dict, matrix_days: list,
                            matrix_note: str = "", notes=None) -> dict:
-    """組出 initial_pools.json：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 站上三均線 N 日內）、A1 追蹤（收盤確認後還沒拉回）、A2 池（拉回整理 1～6 天）、B 候選池、
+    """組出 initial_pools.json：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ 昨日最高均線）、A1 追蹤（收盤確認後還沒拉回）、A2 池（拉回整理 1～6 天）、B 候選池、
     分時量矩陣（候選股 × 開盤後每分鐘）、兩個市場的趨勢基準（前 19 日收盤）、法人參考資料。"""
     a1 = sorted(c for c, b in bases.items()
                 if b["market"] not in UNRELIABLE_MARKETS and a1_eligible(c, b, pools))
@@ -2921,6 +2939,14 @@ def _night_b_lines(bc: dict, bases: dict, init: dict, pools: dict) -> list:
     return out
 
 
+def b_confirm_possible(e: dict, base: dict = None) -> bool:
+    """B 確認同時要「預估全日量 ≤ B 訊號日量 × B_SHRINK_RATIO」和「預估全日成交額 ≥ B_MIN_EST_TURNOVER」。
+    成交額 ≈ 量 × 價，所以預估成交額最多 ≈ B_SHRINK_RATIO × B 訊號日量 × 最高可能價（前收 × 1.1 漲停）；這個上限還不到門檻的，盤中怎麼走都不可能確認。"""
+    vol = float(e.get("burst_vol") or 0.0)
+    px = float((base or {}).get("yest_close") or e.get("burst_close") or 0.0)
+    return B_SHRINK_RATIO * vol * 1000.0 * px * 1.1 >= B_MIN_EST_TURNOVER
+
+
 def build_night_message(init: dict, bases: dict, pools: dict, asof_str: str, index_ctx, *, market_total: int, n_scanned: int,
                         n_liquid: int, n_b_new: int, warns=None) -> str:
     """盤後運算（一則）：摘要（檔數＋指數今收與趨勢）→ [異常才有的 ⚠️ 注意] → A1 追蹤 → A2 池 → B 池。區塊之間空一行（太長時 send_telegram 依空行拆則）。"""
@@ -2945,6 +2971,12 @@ def build_night_message(init: dict, bases: dict, pools: dict, asof_str: str, ind
     a2_nomx = sorted(cd for cd in (init.get("A2_tracking_pool") or {}) if cd not in matrix)
     if a2_nomx:
         warns.append(f"A2 池有 {len(a2_nomx)} 檔沒有分時量矩陣，盤中不會觸發 A2：{'、'.join(a2_nomx[:10])}{'…' if len(a2_nomx) > 10 else ''}")
+    b_dead = sorted(cd for cd, e in bc.items() if e.get("status") == "Watching" and not b_confirm_possible(e, bases.get(cd) or (init.get("stock_bases") or {}).get(cd)))
+    if b_dead:
+        need = B_MIN_EST_TURNOVER / B_SHRINK_RATIO / 1e8
+        warns.append(f"B 池 {len(b_dead)}/{len(bc)} 檔在目前規則下不可能確認：B 確認要「預估量 ≤ B 訊號日量 × {B_SHRINK_RATIO:g}」又要「預估成交額 ≥ {B_MIN_EST_TURNOVER / 1e8:g} 億」，"
+                     f"所以 B 訊號日成交額至少要約 {need:.1f} 億（{'、'.join(b_dead[:8])}{'…' if len(b_dead) > 8 else ''}）。"
+                     f"要讓 B 有機會觸發：調低 B_MIN_EST_TURNOVER，或把 B_MIN_TURNOVER 設成 ≥ {need:.1f} 億讓這類標的不進池")
     sections = [head]
     if warns:
         sections.append(["⚠️ <b>注意</b>"] + [f" • {w}" for w in warns])
