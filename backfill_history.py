@@ -1,6 +1,8 @@
-"""一次性補歷史 backfill_history.py（v4）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
+"""一次性補歷史 backfill_history.py（v5）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
 並把每一次 A2 觸發（二次加碼）也重播出來寫進報表；最後順便做一次「收盤後選池」，直接產生明天要用的 initial_pools.json。
-這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.2）。跑完不需要再跑。
+這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.3）。跑完不需要再跑。
+v5：A1 首次放量資格跟著 radar v70.3 放寬（A1_LATE_DAYS = 2）：站上三均線當天，或站上後第 2 天（前一天剛好是第 1 天收在三均線之上）都算；
+    同一波已經在追蹤的（前一筆 A1 還沒移出）不會在第 2 天重複記一筆。例如 6672 的 9/23 站上、9/24 爆量，現在會被抓到。
 v4 跟著 v70.2 無期限 A1 追蹤規則更新：
   ① A1 追蹤不再有 10 日到期：收盤 ≥ MA5 持續追蹤；MA10 ≤ 收盤 < MA5 進 A2；跌破 MA10 / 突破日低點，或 A2 拉回逾 6 日才移出。
   ② 不再叫你「接著手動跑 baseline」：選池已經搬到收盤後（radar），所以這支最後直接呼叫 radar.scan_core 產生 initial_pools.json（BACKFILL_NO_SCAN=1 可跳過）。
@@ -12,7 +14,7 @@ v4 跟著 v70.2 無期限 A1 追蹤規則更新：
   注意：日 K 看不到盤中，無法重播「確認發動」，所以補進來的 B 一律是 Watching（還在等）。
 【A1 追蹤 / A2 池：日 K 近似重播（只是推估）】
   盤中的 A1 通知 + 收盤確認，用日 K 近似成：
-    前一日收盤 ≤ 前一日 max(MA5/10/20)；收盤 > MA5/10/20（含當日收盤）；漲幅 > 2%；收盤 > 開盤；收盤 > 當日均價(成交額/成交量，當 VWAP 近似)；
+    「站上三均線 N 日內」：到前一日為止連續站上 MA5/10/20 不超過 A1_LATE_DAYS - 1 天（前一日收盤 ≤ 前一日 max(MA5/10/20) 是 0 天）；收盤 > MA5/10/20（含當日收盤）；漲幅 > 2%；收盤 > 開盤；收盤 > 當日均價(成交額/成交量，當 VWAP 近似)；
     當日成交量 ≥ 前 5 日均量 × 1.5 且 ≥ 1,000 張；當日成交額 ≥ 30 億。（5 日均量 ≥ 1,000 張才納入）
   之後逐日套用追蹤規則（與 radar 13:35 結算一致）：收盤跌破 MA10 → 移出；收盤跌破突破日低點（= A1 當日最低價）→ 移出；
     連續「收盤 < MA5」超過 A2_MAX_DAYS（6）天 → 移出（拉回逾 6 日未站回 MA5）；沒有固定追蹤期限。
@@ -113,6 +115,7 @@ def replay_a(series: dict, cal: list):
     for code, s in series.items():
         pos = {d: i for i, d in enumerate(s["dates"])}
         c, o, l, v, val = s["c"], s["o"], s["l"], s["v"], s["val"]
+        code_recs = []                                                    # 這檔已經重播出來的 A1 紀錄（判斷「這一波有沒有發過」）
         for sd in win:
             i = pos.get(sd)
             if i is None or i < 21:
@@ -121,9 +124,11 @@ def replay_a(series: dict, cal: list):
             if avg5 < rd.MIN_VOL5_LOTS:
                 continue
             pc = c[i - 1]
-            prev_ma_max = max(_mean(c[i - 5:i]), _mean(c[i - 10:i]), _mean(c[i - 20:i]))
-            if pc > prev_ma_max:
+            above = rd.consecutive_above(c, i - 1)                       # 到前一日為止連續站上三均線幾天（0 = 前一日收盤 ≤ 前一日最高均線）
+            if above > rd.A1_LATE_DAYS - 1:
                 continue
+            if above >= 1 and any(r["signal_day"] < sd and (r["end_day"] is None or r["end_day"] >= sd) for r in code_recs):
+                continue                                                  # 同一波已經發過 A1、還在追蹤：不重複（與 radar 的 a1_late_blocked 一致）
             ma5, ma10, ma20 = _mean(c[i - 4:i + 1]), _mean(c[i - 9:i + 1]), _mean(c[i - 19:i + 1])
             if not (c[i] > ma5 and c[i] > ma10 and c[i] > ma20):
                 continue
@@ -153,10 +158,12 @@ def replay_a(series: dict, cal: list):
                     status, end_day, why = "dead", t, f"拉回逾{rd.A2_MAX_DAYS}日未站回MA5"
                     break
             last = pos.get(cal[-1])
-            out.append({"code": code, "name": s["name"], "market": s["market"], "signal_day": sd, "entry_price": c[i], "breakout_low": l[i],
-                        "status": status, "end_day": end_day, "why": why, "age": len(later), "pullback_days": n_pb if status == "alive" else 0,
-                        "last_close": c[last] if last is not None else None,
-                        "end_close": c[pos[end_day]] if end_day in pos else None})
+            rec = {"code": code, "name": s["name"], "market": s["market"], "signal_day": sd, "entry_price": c[i], "breakout_low": l[i],
+                   "status": status, "end_day": end_day, "why": why, "age": len(later), "pullback_days": n_pb if status == "alive" else 0,
+                   "last_close": c[last] if last is not None else None, "above_days": above,
+                   "end_close": c[pos[end_day]] if end_day in pos else None}
+            out.append(rec)
+            code_recs.append(rec)
     return out, per_day
 
 
@@ -333,7 +340,7 @@ def main() -> int:
         rows.append({"類型": TYPE_A_MEMBER, "代號": r["code"], "名稱": r["name"], "市場": r["market"], "訊號日": r["signal_day"].isoformat(),
                      "狀態": r["status"], "目前階段": stage, "結束日": r["end_day"].isoformat() if r["end_day"] else "", "原因": r["why"],
                      "突破日低點/B防線": round(r["breakout_low"], 2), "價格": round(r["entry_price"], 2), "5日均量>=1000張": "是",
-                     "備註": "A1 當日收盤確認（收盤價當通知價）；這一列是進入 A1 追蹤，不是 A2 觸發"})
+                     "備註": "A1 當日收盤確認（收盤價當通知價）；這一列是進入 A1 追蹤，不是 A2 觸發" + ("｜站上三均線第 %d 天首次放量（放寬後新增的類型）" % (r["above_days"] + 1) if r.get("above_days") else "")})
     for t in sorted(t_all, key=lambda x: (x["day"], x["code"])):
         rows.append({"類型": TYPE_A_TRIGGER, "代號": t["code"], "名稱": t["name"], "市場": t["market"], "訊號日": t["day"].isoformat(),
                      "狀態": "觸發", "目前階段": "", "結束日": "", "原因": f"拉回整理 {t['consol_days']} 天後再發動",
