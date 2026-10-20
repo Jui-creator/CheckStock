@@ -1,6 +1,12 @@
-"""一次性補歷史 backfill_history.py（v5）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
+"""一次性補歷史 backfill_history.py（v5.2）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
 並把每一次 A2 觸發（二次加碼）也重播出來寫進報表；最後順便做一次「收盤後選池」，直接產生明天要用的 initial_pools.json。
-這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.3）。跑完不需要再跑。
+這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.2）。跑完不需要再跑。
+v5.2：重複執行（BACKFILL_FORCE=1）不再把同一批「補歷史」移出紀錄一直累加進 closed（radar.save_pools 會依 池／代號／日期／原因／進場日 去重，並順手清掉舊檔裡已經累積的重複）。
+v5.1 新增「只重跑選池」模式（BACKFILL_RESCAN_ONLY=1，workflow 勾 rescan_only）：
+  不重播、不補任何標的、不碰追蹤清單的內容；只用「現在的 signal_history.json」重新做一次收盤後選池，覆寫 initial_pools.json。
+  用在：規則改了（例如 A1_LATE_DAYS）但 radar 當天的 13:35 選池已經跑完（daily.yml 因為執行鎖會直接忽略），想讓明天就用新規則。
+  前提：signal_history.json 已經結算到基準日（asof）——radar 當天 13:35 結算過就符合；沒結算過會中止，避免用過期的追蹤清單選池。
+  耗時約 50～60 分鐘（全市場日 K 約 37 分鐘＋候選股 1 分 K 約 9 分鐘）；會再發一則【盤後運算】。不需要勾 force。
 v5：A1 首次放量資格跟著 radar v70.3 放寬（A1_LATE_DAYS = 2）：站上三均線當天，或站上後第 2 天（前一天剛好是第 1 天收在三均線之上）都算；
     同一波已經在追蹤的（前一筆 A1 還沒移出）不會在第 2 天重複記一筆。例如 6672 的 9/23 站上、9/24 爆量，現在會被抓到。
 v4 跟著 v70.2 無期限 A1 追蹤規則更新：
@@ -28,7 +34,7 @@ v4 跟著 v70.2 無期限 A1 追蹤規則更新：
   限制：沒有 BEAR（A2 在空頭禁止）的判斷；成交量用「實際全日量」而不是盤中預估量，所以會比實盤寬鬆（偏樂觀）；
         沒有真正的「連續 2 輪」二次確認；通知價用收盤價近似。補進去的標的 src = "backfill"、origin = "A1_CLOSE_CONFIRMED"。
 安全：signal_history.json 已有內容時預設中止；BACKFILL_FORCE=1 才會執行，且只「新增」不存在的代號，不覆蓋既有資料。
-環境變數：FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、BACKFILL_FORCE=1、BACKFILL_NO_SCAN=1（只補 signal_history.json，不做收盤後選池）
+環境變數：FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、BACKFILL_RESCAN_ONLY=1、BACKFILL_FORCE=1、BACKFILL_NO_SCAN=1（只補 signal_history.json，不做收盤後選池）
 輸出：signal_history.json（補好歷史）、initial_pools.json（選池，明天盤中用）、backfill_report.csv（每筆重播結果，供你檢查合不合理）
 跑完請確認 history_backfill.yml 會把 signal_history.json、initial_pools.json、backfill_report.csv 一起 commit。
 """
@@ -216,13 +222,16 @@ def replay_a2_triggers(series: dict, cal: list, a_all: list):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("一次性補歷史 backfill_history.py v4（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
+    print("一次性補歷史 backfill_history.py v5.2（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
     print("=" * 55, flush=True)
     force = _truthy("BACKFILL_FORCE")
     do_scan = not _truthy("BACKFILL_NO_SCAN")
+    rescan = _truthy("BACKFILL_RESCAN_ONLY")
     pools, pool_note = rd.load_pools()
     print(f"[追蹤清單] {pool_note}", flush=True)
-    if any(pools[k] for k in ("a", "b", "a1_pending")) and not force:
+    if rescan:
+        print("[重跑選池] BACKFILL_RESCAN_ONLY=1：不重播、不補標的，只用現在的 signal_history.json 重新選池並覆寫 initial_pools.json", flush=True)
+    if any(pools[k] for k in ("a", "b", "a1_pending")) and not force and not rescan:
         msg = "signal_history.json 已經有內容，補歷史會中止（避免覆蓋）。確定要補請設 BACKFILL_FORCE=1（只會新增不存在的代號）。"
         print(msg, flush=True)
         rd.send_telegram(f"⚠️ <b>【補歷史】</b> {msg}")
@@ -262,6 +271,30 @@ def main() -> int:
     series = {c: s for c, s in series.items() if s["dates"][-1] == asof}
     if not merged_today:
         print(f"[補歷史] 基準日 {asof}；{rd.normalize_units(feed, series, snap, asof)}", flush=True)
+    if rescan:
+        asof_str = asof.isoformat()
+        if (pools.get("asof") or "") != asof_str:
+            msg = (f"追蹤清單的結算日是 {pools.get('asof') or '（空）'}，和選池基準日 {asof_str} 不同：signal_history.json 還沒結算到基準日，"
+                   f"直接選池會用到過期的追蹤清單。請先讓 radar 當天 13:35 結算（或改用完整補歷史），再重跑。")
+            print(msg, flush=True)
+            rd.send_telegram(f"❌ <b>【重跑選池】</b> {msg}")
+            return 1
+        try:
+            industry = feed.industry_map()
+        except Exception as exc:
+            print(f"[重跑選池] 產業別查詢失敗：{type(exc).__name__}: {exc}", flush=True)
+            industry = {}
+        try:
+            init, bases, index_ctx, info = rd.scan_core(feed, asof, series, universe, pools, industry=industry, snap=snap,
+                                                        notes=["重跑選池（規則更新後）"], ic_budget=rd.SCAN_IC_BUDGET_SECONDS,
+                                                        max_new_curves=None)
+        except rd.ScanError as exc:
+            rd.send_telegram(f"❌ <b>【重跑選池】失敗</b>：{exc}。initial_pools.json 沒有被覆寫（維持原本的版本）。")
+            return 1
+        rd.send_telegram(rd.build_night_message(init, bases, pools, asof_str, index_ctx, market_total=info["market_total"], n_scanned=info["n_scanned"],
+                                                n_liquid=info["n_liquid"], n_b_new=info["n_b_new"],
+                                                warns=["這是規則更新後手動重跑的選池，覆寫了 13:35 radar 產生的 initial_pools.json"]))
+        return 0
     cal = [d for d in trading_calendar(series) if d <= asof]
     if len(cal) < 35:
         msg = f"交易日曆只有 {len(cal)} 天，不夠重播（需要至少 35 天：MA20 暖機＋近期報表）"
