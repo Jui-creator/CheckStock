@@ -1,6 +1,7 @@
-"""法人資料 baseline.py（v70.1）：每個交易日傍晚（建議 18:00 之後，由 Google Apps Script 呼叫 baseline.yml）執行。
+"""法人資料 baseline.py（v70.2）：每個交易日傍晚（建議 18:00 之後，由 Google Apps Script 呼叫 baseline.yml）執行。
 v70 起 baseline 只做一件事：算「官方外資、投信近 5 日買賣超」→ 寫 institutional.json；隔天 radar 盤前讀它，貼到 A1 通知的法人燈號。
 A1 / A2 / B 選池、分時量矩陣、指數基準都已經搬到 radar 收盤後（13:35 結算完接著做），這裡不再碰。
+v70.2：A1 追蹤改為無固定期限狀態機；baseline 只算法人，版本同步，不執行 A1/A2 階段邏輯。
 為什麼法人要等傍晚：證交所三大法人買賣超日報、櫃買三大法人日報約傍晚才公布；收盤後 13:35 還沒有。
 v70.1 修正（某天櫃買 10/13 沒有資料）：
   ① 舊版對「不是最新的那幾天」只試 1 次，遇到一次暫時性斷線（例如 ChunkedEncodingError）就放棄，該日整個市場變成 ➖。
@@ -13,7 +14,7 @@ v70.1 修正（某天櫃買 10/13 沒有資料）：
   2. 官方法人（證交所 T86 ＋ 櫃買）近 5 個交易日；櫃買表頭沒有法人名稱 → 依固定位置解析並用「三大法人合計」驗算
   3. 仍缺的日子：用昨晚的 institutional.json 補回；B 池標的再不行才用富邦 institutional_trades 逐檔補
   4. 原子寫入 institutional.json（只含外資、投信，單位：張，最舊→最新），發一則 Telegram
-需要同資料夾的 radar.py（v70：官方法人抓取與解析函式在那裡）。
+需要同資料夾的 radar.py（v70.2：官方法人抓取與解析函式在那裡）。
 環境變數：TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、FORCE（可選）
 """
 import os
@@ -187,7 +188,7 @@ def fubon_fill(feed, table: dict, targets: dict, day_list: list) -> int:
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("法人資料 baseline.py v70.1（官方外資、投信近 5 日買賣超 → institutional.json）", flush=True)
+    print("法人資料 baseline.py v70.2（官方外資、投信近 5 日買賣超 → institutional.json）", flush=True)
     print("=" * 55, flush=True)
     feed = rd.FubonFeed()
     try:
