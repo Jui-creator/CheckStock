@@ -1,4 +1,4 @@
-"""飆股雷達 v70.2：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
+"""飆股雷達 v70.3：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
   08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
@@ -9,7 +9,7 @@
 【收盤後選池（13:35 之後，radar 自己做）】
   資料來源：① 背景預抓（radar 一啟動就在背景慢慢抓，富邦限速約每秒 1 次）的「截至昨天」全市場日 K、產業別、候選股 1 分 K；
             ② 13:35 最終快照合成的「今天」日 K 棒（開高低收量額）；③ 即時指數（今天收盤）。
-  做的事：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ 昨日最高均線）、A1 追蹤 / A2 池階段重算、B 池全市場掃描（KD 低檔金叉＋爆量＋收盤位置）、
+  做的事：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 站上三均線 N 日內，N = A1_LATE_DAYS）、A1 追蹤 / A2 池階段重算、B 池全市場掃描（KD 低檔金叉＋爆量＋收盤位置）、
           分時量矩陣（20 個交易日截至昨天）、指數前 19 日收盤 → 原子寫入 initial_pools.json，並發一則【盤後運算】Telegram。
   官方資料要等到：三大法人（證交所 T86、櫃買）約傍晚；富邦歷史日 K / 1 分 K 當日資料盤後 16:30 才更新 → 所以今天的 K 棒用快照合成
   （成交量比官方日 K 約少 1～2%：官方含盤後零股／定價；隔天預抓到的就是官方值，自動修正）。
@@ -24,7 +24,7 @@
   任一階段收盤 < MA10 或 < 突破日低點 → 立即移出；A2 池連續拉回超過 6 天仍沒站回 MA5 → 移出。只有 A2 池才可能觸發 A2。
 【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
-  A1：昨收 ≤ 昨日最高均線；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
+  A1：站上三均線 N 日內（昨日以前連續站上不超過 N-1 天，N = A1_LATE_DAYS = 2）；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
   A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
@@ -122,7 +122,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v70.2"
+RADAR_VERSION = "v70.3"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -153,6 +153,9 @@ KD_MIN_DAYS = 30
 # ---- A1（首發突破，純硬條件）----
 A1_ENABLED = True
 A1_CHG_MIN = 2.0                    # 漲幅 > 2%；不設上限
+A1_LATE_DAYS = 2                    # v70.3：站上三均線後第幾個交易日內都算「首次放量」。N = 1 → 只有站上當天（舊規則：昨收 ≤ 昨日最高均線）；
+                                    #   N = 2 → 站上當天，或站上後第 2 天（昨天剛好第一天收在三均線之上，今天才爆量也抓得到，例如 6672 9/23 站上、9/24 爆量）。
+                                    #   「這一波」已經發過 A1（在 A1 追蹤 / A2 池、或待收盤確認）的不會在第 2 天重複發。
 A1_VOL_RATIO = 1.5                  # NORMAL：同期量比 ≥ 1.5（等價於預估全日量 ≥ 5 日均量 × 1.5）
 A1_VOL_RATIO_BEAR = 2.0             # BEAR：× 2.0
 A1_MIN_EST_LOTS = 1000              # 預估全日成交量 ≥ 1,000 張
@@ -931,6 +934,46 @@ def after_cutoff(t: datetime) -> bool:
 # =========================
 # 指標與判斷（盤中、收盤、夜間共用的純函式）
 # =========================
+def consecutive_above(closes, end_idx: int, cap: int = 30) -> int:
+    """到 end_idx（含）為止，連續「收盤 > MA5 且 > MA10 且 > MA20」的天數（MA 為含當天收盤的真實均線）。第一個沒站上的日子就停；資料不足 20 日算 0。
+    0 = 該日收盤不在三條均線之上（= 舊規則的「昨收 ≤ 昨日最高均線」）；1 = 該日是站上三均線的第一天。"""
+    n, j = 0, end_idx
+    while j >= 19 and n < cap:
+        c = closes[j]
+        if c > sum(closes[j - 4:j + 1]) / 5 and c > sum(closes[j - 9:j + 1]) / 10 and c > sum(closes[j - 19:j + 1]) / 20:
+            n += 1
+            j -= 1
+        else:
+            break
+    return n
+
+
+def above_days_of(base: dict) -> int:
+    """基底裡「到昨天為止已連續站上三均線幾天」。舊版 initial_pools.json 沒有這欄：昨收 ≤ 昨日最高均線 = 0，否則視為很多天（99，不符合新鮮條件）。"""
+    d = base.get("above_days")
+    if d is None:
+        return 0 if base["yest_close"] <= base["prev_ma_max"] else 99
+    return int(d)
+
+
+def a1_fresh(base: dict) -> bool:
+    """A1「首次放量」資格：昨天以前連續站上三均線不超過 A1_LATE_DAYS - 1 天（N = 2 → 昨天剛好是第 1 天也算）。"""
+    return above_days_of(base) <= A1_LATE_DAYS - 1
+
+
+def a1_late_blocked(code: str, base: dict, pools: dict) -> bool:
+    """「這一波沒發過 A1」：已經站上第 2 天以後（above_days ≥ 1）才補抓的，如果這檔已經在 A1 追蹤 / A2 池、或今天已通知待收盤確認，就是同一波，不重複發。
+    above_days = 0（今天才是站上第一天）不受影響，維持原本行為。"""
+    if above_days_of(base) < 1:
+        return False
+    return code in (pools.get("a") or {}) or code in (pools.get("a1_pending") or {})
+
+
+def a1_eligible(code: str, base: dict, pools: dict) -> bool:
+    """進 A1 候選池：流動性 ≥ 1,000 張（base["liquid"]）＋ 首次放量資格 ＋ 不是同一波已發過的。市場資料可靠性由呼叫端另外檢查。"""
+    return bool(base["liquid"]) and a1_fresh(base) and not a1_late_blocked(code, base, pools)
+
+
 def precompute_static(base: dict) -> dict:
     """昨日收盤後就固定的數字。ma*_cut = 今日收盤價「等於」該條均線的價位；prev_ma_max = 昨日 MA5/10/20 中最高者。"""
     base["ma5_cut"] = base["sum_4"] / 4
@@ -1018,7 +1061,7 @@ def a1_stage(base: dict, price, open_, chg, mas, vwap, est, mode: str):
         return "chg"
     if not open_ or price <= open_:
         return "red"
-    if not (base["yest_close"] <= base["prev_ma_max"] and price > mas[0] and price > mas[1] and price > mas[2]):
+    if not (a1_fresh(base) and price > mas[0] and price > mas[1] and price > mas[2]):                  # 站上三均線第 1～N 天內；今天現價同時站上即時三均線
         return "cross"
     if VWAP_FILTER and (vwap is None or price <= vwap):
         return "vwap"
@@ -1838,6 +1881,7 @@ def make_base(code: str, s: dict, industry: str = "", track=None):
         "liquid": avg5 >= MIN_VOL5_LOTS,
     }
     precompute_static(base)
+    base["above_days"] = consecutive_above(s["c"], len(s["c"]) - 1)                 # v70.3：到基準日為止連續站上三均線幾天（0 = 基準日收盤不在三均線之上）
     base["b_hit"] = b_scan_last(s) if (B_ENABLED and avg5 >= B_MIN_VOL5_LOTS) else None      # B 不看 liquid（5 日均量 1,000 張）；B_MIN_VOL5_LOTS = 0 → 全市場
     if track is not None:
         base["a2"] = consolidation_run(s["dates"], s["c"], s["v"], track[0], track[1])
@@ -2117,7 +2161,7 @@ def scan_core(feed, asof: date_cls, series: dict, universe: dict, pools: dict, *
         print(f"    {cd} {e.get('name', '')}｜{e.get('stage')}｜A1 確認 {e.get('entry_date')}｜連續拉回 {e.get('pullback_days', 0)} 天", flush=True)
     merge = merge_b_candidates(pools, bases)
     print(f"[B 池] 今晚新增 {merge['added']} 檔、略過 {merge['skipped']} 檔（已在池中或同一訊號日已移出）", flush=True)
-    a1_codes = [c for c, b in bases.items() if b["liquid"] and b["yest_close"] <= b["prev_ma_max"]]
+    a1_codes = [c for c, b in bases.items() if a1_eligible(c, b, pools)]
     matrix_codes = sorted(c for c in (set(a1_codes) | set(pools["a"]) | set(pools["b"])) if c in bases)
     lowliq = {c for c in matrix_codes if not bases[c]["liquid"]}
     print(f"[候選池] A1 候選 {len(a1_codes)} 檔、A1 追蹤＋A2 池 {len(pools['a'])} 檔、B 池 {len(pools['b'])} 檔 → 分時量矩陣 {len(matrix_codes)} 檔（低量股 {len(lowliq)} 檔）", flush=True)
@@ -2545,10 +2589,10 @@ def reconcile_a1_confirm(pools: dict, bases: dict, asof_str: str) -> dict:
 
 def assemble_initial_pools(bases: dict, pools: dict, asof_iso: str, index_ctx: dict, inst_meta: dict, matrix: dict, matrix_days: list,
                            matrix_note: str = "", notes=None) -> dict:
-    """組出 initial_pools.json：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 昨收 ≤ 昨日最高均線）、A1 追蹤（收盤確認後還沒拉回）、A2 池（拉回整理 1～6 天）、B 候選池、
+    """組出 initial_pools.json：A1 候選池（5 日均量 ≥ 1,000 張 ＋ 站上三均線 N 日內）、A1 追蹤（收盤確認後還沒拉回）、A2 池（拉回整理 1～6 天）、B 候選池、
     分時量矩陣（候選股 × 開盤後每分鐘）、兩個市場的趨勢基準（前 19 日收盤）、法人參考資料。"""
     a1 = sorted(c for c, b in bases.items()
-                if b["liquid"] and b["market"] not in UNRELIABLE_MARKETS and b["yest_close"] <= b["prev_ma_max"])
+                if b["market"] not in UNRELIABLE_MARKETS and a1_eligible(c, b, pools))
     a2_pool, a1_track = {}, {}                  # A2 池 = 拉回整理 1～6 天；A1 追蹤 = A1 收盤確認後還沒拉回（或拉回已超過窗口）
     for code, e in pools["a"].items():
         item = dict(e)
@@ -2573,7 +2617,7 @@ def assemble_initial_pools(bases: dict, pools: dict, asof_iso: str, index_ctx: d
     return {
         "metadata": meta,
         "indicator_parameters": {
-            "min_vol5_lots": MIN_VOL5_LOTS, "a1_chg_min": A1_CHG_MIN, "a1_vol_ratio": A1_VOL_RATIO, "a1_vol_ratio_bear": A1_VOL_RATIO_BEAR,
+            "min_vol5_lots": MIN_VOL5_LOTS, "a1_chg_min": A1_CHG_MIN, "a1_late_days": A1_LATE_DAYS, "a1_vol_ratio": A1_VOL_RATIO, "a1_vol_ratio_bear": A1_VOL_RATIO_BEAR,
             "a1_min_est_lots": A1_MIN_EST_LOTS, "a_min_est_turnover": A_MIN_EST_TURNOVER, "a2_days": [A2_MIN_DAYS, A2_MAX_DAYS],
             "a2_vol_ratio": A2_VOL_RATIO, "a_track_days": None, "a_track_unlimited": True, "b_kd_low": B_KD_LOW, "b_vol_ratio": B_VOL_RATIO,
             "b_lowclose_pct": B_LOWCLOSE_PCT, "b_close_loc_min": B_CLOSE_LOC_MIN, "b_shrink_ratio": B_SHRINK_RATIO,
@@ -2689,6 +2733,8 @@ def build_a1_message(sig: dict, n_today: int, now: datetime) -> str:
     lines = [f"<b>【A1：首發突破】</b> <b>{sig['code']} {sig['name']}</b>"]
     if sig.get("mode") == "BEAR":
         lines.append(f"🔴 <b>大盤空頭</b>：同期量比提高為 {A1_VOL_RATIO_BEAR:g} 倍")
+    if (sig.get("above_days") or 0) >= 1 and sig.get("above_days") != 99:
+        lines.append(f"🕐 <b>站上三均線第 {sig['above_days'] + 1} 天首次放量</b>（昨天已收在三均線之上）")
     lines += [
         "━━━━━━━━━━━━━━━",
         f"📈 <b>現價：{sig['price']:.2f} ({_pc(sig['chg'])})</b>｜開 {_p2(sig.get('open'))}",
@@ -2883,7 +2929,7 @@ def build_night_message(init: dict, bases: dict, pools: dict, asof_str: str, ind
     n_b_low = sum(1 for cd in bc if cd in bases and not bases[cd]["liquid"])
     head = [f"📦 <b>【盤後運算】</b>基準日 {asof_str}，下一個交易日 {meta['trade_date']}",
             f"全市場 {market_total:,} 檔，掃描 {n_scanned:,} 檔｜5 日均量 ≥ {MIN_VOL5_LOTS:,} 張：{n_liquid:,} 檔",
-            f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張＋昨收 ≤ 昨日最高均線）",
+            f"🟢 A1 候選池 {c['a1']} 檔（5 日均量 ≥ {MIN_VOL5_LOTS:,} 張＋站上三均線 {A1_LATE_DAYS} 日內）",
             f"🟢 A1 追蹤 {c.get('a1_track', 0)} 檔（無固定期限；尚未拉回時不會觸發 A2）",
             f"🟡 A2 池 {c['a2']} 檔（拉回整理 {A2_MIN_DAYS}～{A2_MAX_DAYS} 天，明天盤中重新站回才觸發 A2）",
             f"🔵 B 池 {c['b']} 檔（全市場，不篩 5 日均量；今晚新增 {n_b_new}｜其中 5 日均量 < {MIN_VOL5_LOTS:,} 張 {n_b_low} 檔）"]
@@ -2980,7 +3026,7 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
     sections.append([
         "📋<b>規則摘要</b>",
         "   • <b>A1 突破</b>：",
-        "      1️⃣站上 MA5/10/20",
+        f"      1️⃣站上 MA5/10/20（站上{A1_LATE_DAYS}日內）",
         f"      2️⃣漲>{A1_CHG_MIN:g}% ＋ 紅K ＋ 現價>VWAP",
         f"      3️⃣量比≥{A1_VOL_RATIO:g} (BEAR 需量比≥{A1_VOL_RATIO_BEAR:g})",
         f"      4️⃣預估量≥{A1_MIN_EST_LOTS:,}張",
@@ -3081,7 +3127,7 @@ def evaluate_a1(base: dict, table, row: dict, x: float, mode: str, funnel: dict)
     if stage:
         return None
     return {"pool": "A1", "kind": "A1", "code": base["code"], "name": base["name"], "market": base["market"], "industry": base.get("industry", ""),
-            "price": price, "open": open_, "chg": chg, "yest_close": base["yest_close"], "prev_ma_max": base["prev_ma_max"],
+            "price": price, "open": open_, "chg": chg, "yest_close": base["yest_close"], "prev_ma_max": base["prev_ma_max"], "above_days": above_days_of(base),
             "ma5": mas[0], "ma10": mas[1], "ma20": mas[2], "vwap": vwap, "vwap_pct": (price / vwap - 1) * 100.0,
             "vol": vol, "val": val, "est": est, "avg5": base["avg_5d_vol_simple"], "inst5": base.get("inst5"),
             "inst5_f": base.get("inst5_f"), "inst5_t": base.get("inst5_t"), "mode": mode}
@@ -3170,7 +3216,7 @@ def debug_line(base: dict, table, row: dict, x: float, mode: str, pools: dict) -
     est = estimate_full(vol, val, table, x, base["avg_5d_vol_simple"]) if table else None
     vw = vwap_of(vol, val)
     a_e, b_e = pools["a"].get(base["code"]), pools["b"].get(base["code"])
-    return (f"[診斷 {base['code']} {base['name']}] 趨勢 {mode}｜價 {price}｜昨收 {base['yest_close']} 昨日最高均線 {base['prev_ma_max']:.2f}"
+    return (f"[診斷 {base['code']} {base['name']}] 趨勢 {mode}｜價 {price}｜昨收 {base['yest_close']} 昨日最高均線 {base['prev_ma_max']:.2f}｜已連續站上三均線 {above_days_of(base)} 天（N={A1_LATE_DAYS}）"
             f"｜即時 MA5/10/20 {mas[0]:.2f}/{mas[1]:.2f}/{mas[2]:.2f}｜VWAP {'無' if vw is None else round(vw, 2)}"
             f"｜R {'無' if not est else round(est['R'], 3)} 預估量 {'無' if not est else round(est['est_vol'])}（5日均量 {base['avg_5d_vol_simple']:.0f}）"
             f"同期量比 {'無' if not est or est['sync_ratio'] is None else round(est['sync_ratio'], 2)}"
@@ -3205,7 +3251,8 @@ def process_poll(snap: dict, ctx: dict, regime, now: datetime, funnel: dict):
             if sig:
                 a2c.append(sig)
                 done = True
-        if A1_ENABLED and liquid and code in a1_set and code not in STATE["triggered"] and not (done and ONE_SIGNAL_PER_STOCK):
+        if A1_ENABLED and liquid and code in a1_set and code not in STATE["triggered"] and not a1_late_blocked(code, base, pools) \
+                and not (done and ONE_SIGNAL_PER_STOCK):
             sig = evaluate_a1(base, table, row, x, mode, funnel)
             if sig:
                 a1c.append(sig)
