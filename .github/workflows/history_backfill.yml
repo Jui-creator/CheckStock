@@ -1,24 +1,28 @@
-name: 一次性補歷史（A1 追蹤 / A2 池 / B 池，並直接選池）
+name: 補歷史 / 重跑選池（A1 追蹤 / A2 池 / B 池 → initial_pools.json）
 on:
-  # 上線時只跑一次，手動到 Actions 頁面點「Run workflow」。不使用 schedule，也不需要 Apps Script 觸發。
-  # v3 做的事：用富邦日 K 往回重播最近 10 個交易日 → 補好 signal_history.json（A1 追蹤、A2 池、B 池，含拉回天數與階段）
-  #            → 接著做一次「收盤後選池」，直接產生明天要用的 initial_pools.json（不用再手動跑 baseline）。
-  # 跑完會把 signal_history.json、initial_pools.json、backfill_report.csv 一起 commit 回 repo。
-  #
-  # 什麼時候跑：
-  #   - 13:35 之後最好（收盤後）：富邦歷史日 K 16:30 才有今天，程式會用 13:35 後的最終快照合成今天的 K 棒，結果是「今天收盤後」的選池，明天可以直接用。
-  #   - 盤中或開盤前跑也可以：這時基準日是上一個交易日，選出的池給「今天」用。
-  #   - 不要和 daily.yml 同時跑：兩者都會寫 signal_history.json / initial_pools.json，所以共用同一個 concurrency 群組，會自動排隊。
-  # 耗時：全市場日 K 約 37 分鐘＋候選股 1 分 K 約 9 分鐘＋重播與選池幾分鐘，合計約 55～70 分鐘（timeout 設 120 分鐘）。
+  # 手動到 Actions 頁面點「Run workflow」。不使用 schedule，也不需要 Apps Script 觸發。
+  # 兩種用法（三個勾選框最多勾一個）：
+  #   A. 上線時一次性補歷史：什麼都不勾（signal_history.json 已有內容時會中止，要勾 force 才會「只新增不存在的代號」）。
+  #      用日 K 往回重播 → 補好 signal_history.json → 接著選池產生 initial_pools.json。耗時約 55～70 分鐘。
+  #   B. 規則改了、想讓明天就生效：只勾 rescan_only。
+  #      不重播、不補標的、不改追蹤清單；只用現在的 signal_history.json 重新選池，覆寫 initial_pools.json。
+  #      前提：radar 當天 13:35 已經結算過（signal_history.json 的結算日 = 最新交易日），否則會中止。耗時約 50～60 分鐘，會再發一則【盤後運算】。
+  # 跑完會把 signal_history.json、initial_pools.json、backfill_report.csv（只有用法 A 才有）commit 回 repo。
+  # 不要和 daily.yml 同時跑：兩者都會寫 signal_history.json / initial_pools.json，所以共用同一個 concurrency 群組，會自動排隊。
   workflow_dispatch:
     inputs:
+      rescan_only:
+        description: "只重跑選池（規則更新後讓明天生效；不重播、不補標的、不改追蹤清單）"
+        required: false
+        default: false
+        type: boolean
       force:
-        description: "signal_history.json 已有內容時仍要執行（只新增不存在的代號，不覆蓋既有資料）"
+        description: "【補歷史用】signal_history.json 已有內容時仍要執行（只新增不存在的代號，不覆蓋既有資料）；只重跑選池時不用勾"
         required: false
         default: false
         type: boolean
       no_scan:
-        description: "只補 signal_history.json，不做收盤後選池（不勾 = 補完直接產生 initial_pools.json）"
+        description: "【補歷史用】只補 signal_history.json，不做選池；只重跑選池時不用勾"
         required: false
         default: false
         type: boolean
@@ -55,13 +59,14 @@ jobs:
             ic-sector-
       - name: 還原憑證
         run: echo "${{ secrets.FUBON_CERT_B64 }}" | base64 -d > fubon.p12
-      - name: 補歷史
+      - name: 補歷史 / 重跑選池
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FUBON_ID: ${{ secrets.FUBON_ID }}
           FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
           FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+          BACKFILL_RESCAN_ONLY: ${{ github.event.inputs.rescan_only }}
           BACKFILL_FORCE: ${{ github.event.inputs.force }}
           BACKFILL_NO_SCAN: ${{ github.event.inputs.no_scan }}
         run: |
@@ -75,6 +80,7 @@ jobs:
         with:
           path: ic_sector_cache.json
           key: ic-sector-${{ github.run_id }}
+      # initial_pools.json 沒 commit 成功 = 明天沒有候選池，所以 push 失敗要讓這一步失敗（會觸發下面的失敗通知）
       - name: 儲存結果回 repo
         if: success()
         run: |
@@ -84,7 +90,7 @@ jobs:
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --staged --quiet && exit 0
-          git commit -m "一次性補歷史 $(date '+%Y-%m-%d')"
+          git commit -m "補歷史 / 重跑選池 $(date '+%Y-%m-%d')"
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && exit 0
             echo "push 第 $i 次失敗，5 秒後重試"
@@ -101,7 +107,6 @@ jobs:
             signal_history.json
             initial_pools.json
           if-no-files-found: ignore
-      # 補歷史失敗（含選池失敗）也發 Telegram
       - name: 失敗通知
         if: failure() || cancelled()
         env:
