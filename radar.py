@@ -1,4 +1,4 @@
-"""飆股雷達 v70.4：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
+"""飆股雷達 v70.5：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
   08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
@@ -22,7 +22,7 @@
 【A1 追蹤 / A2 池（v70.2 無固定追蹤期限）】A1 收盤確認成功後先進「A1 追蹤」；只要收盤 ≥ MA5 且守住突破日低點，就持續追蹤，不因天數到期移出。
   某天收盤 < MA5、但仍 ≥ MA10 且 ≥ 突破日低點 → 進「A2 池」（連續拉回 1～6 天）；收盤重新 ≥ MA5 → 回 A1 追蹤、拉回天數歸零。
   任一階段收盤 < MA10 或 < 突破日低點 → 立即移出；A2 池連續拉回超過 6 天仍沒站回 MA5 → 移出。只有 A2 池才可能觸發 A2。
-【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
+【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 爆量日成交額 ≥ 15 億（B_MIN_TURNOVER）＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：站上三均線 N 日內（昨日以前連續站上不超過 N-1 天，N = A1_LATE_DAYS = 2）；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
@@ -122,7 +122,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v70.4"
+RADAR_VERSION = "v70.5"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -178,7 +178,10 @@ B_ENABLED = True
 B_KD_LOW = 40.0                     # 前日 K ≤ 前日 D、當日 K > 當日 D、當日 K < 40
 B_VOL_RATIO = 2.0                   # 當日成交量 ≥ 前 20 日均量 × 2
 B_AVG_DAYS = 20
-B_MIN_TURNOVER = 0                  # 爆量日最低成交額（元）；架構沒有這條，設 0 = 不篩
+B_MIN_TURNOVER = 1_500_000_000      # v70.5：爆量日（B 訊號日）最低成交額 ≥ 15 億（元）才進 B 池；0 = 不篩。
+                                    #   為什麼是 15 億：B 確認要「預估全日量 ≤ B 訊號日量 × 0.6」又要「預估成交額 ≥ B_MIN_EST_TURNOVER（5 億）」，
+                                    #   隔天成交額最多約 0.6 × 訊號日成交額，所以訊號日至少要 5 億 ÷ 0.6 ≈ 8.3 億才有可能確認；
+                                    #   取 15 億，讓隔天量縮到訊號日的 33%～60% 都過得了 5 億（10 億只剩 50%～60% 很窄）。
 B_LOWCLOSE_PCT = 2.0                # 收盤 ≥ 當日最低價 × (1 + 2%)
 B_CLOSE_LOC_MIN = 0.6               # 收盤位置 (收-低)/(高-低) ≥ 60%
 B_WAIT_DAYS = 5                     # B 訊號後第 5 個交易日收盤仍未發動 → B_EXPIRED
@@ -191,7 +194,7 @@ B_REQUIRE_VWAP = True               # 現價 > 即時 VWAP（確認強度）
 B_STATUS_MISS_DAYS = 3              # 連續幾天抓不到收盤資料 → 資料缺失移出
 # v69.2：B 池「全市場」確認，不篩 5 日均量（1,000 張只限 A1 候選池）
 B_FULL_MARKET = True                # 夜間日 K 抓全市場（約 1,900 檔，約 37 分鐘）；False = 回到只抓成交量預篩後約 770 檔
-B_MIN_VOL5_LOTS = 0                 # B 候選的 5 日均量下限（張）；0 = 不篩（B 的篩選靠「爆量 ≥ 20 日均量 2 倍」與盤中預估成交額 ≥ 2 億）
+B_MIN_VOL5_LOTS = 0                 # B 候選的 5 日均量下限（張）；0 = 不篩（B 的篩選靠「爆量 ≥ 20 日均量 2 倍」、爆量日成交額 ≥ 15 億與盤中預估成交額 ≥ 5 億）
 B_LOWLIQ_MIN_CANDLES = 5            # 5 日均量 < 1,000 張的 B 候選，1 分 K 一天最少幾根才算完整日（低量股很多分鐘沒有成交，不會有分 K）
 
 # ---- 法人（官方：證交所 T86、櫃買；只當參考，不是篩選條件）----
@@ -1204,7 +1207,7 @@ def b_scan_last(s: dict):
 
 
 def b_confirm_stage(day_low, est, burst_low, burst_vol, price, ma5, vwap):
-    """B 隔日確認：今日最低價 ≥ B 訊號日最低價；預估全日量 ≤ B 訊號日量 × 0.6；現價 > 即時 MA5（可關）且 > 即時 VWAP（可關）；預估全日金額 ≥ 2 億。
+    """B 隔日確認：今日最低價 ≥ B 訊號日最低價；預估全日量 ≤ B 訊號日量 × 0.6；現價 > 即時 MA5（可關）且 > 即時 VWAP（可關）；預估全日金額 ≥ 5 億（B_MIN_EST_TURNOVER）。
     回傳沒過的關卡（'broken'/'est'/'volume'/'ma5'/'vwap'/'turn'）或 None。"""
     if day_low is None or day_low < burst_low:
         return "broken"
@@ -2637,7 +2640,7 @@ def assemble_initial_pools(bases: dict, pools: dict, asof_iso: str, index_ctx: d
         "indicator_parameters": {
             "min_vol5_lots": MIN_VOL5_LOTS, "a1_chg_min": A1_CHG_MIN, "a1_late_days": A1_LATE_DAYS, "a1_vol_ratio": A1_VOL_RATIO, "a1_vol_ratio_bear": A1_VOL_RATIO_BEAR,
             "a1_min_est_lots": A1_MIN_EST_LOTS, "a_min_est_turnover": A_MIN_EST_TURNOVER, "a2_days": [A2_MIN_DAYS, A2_MAX_DAYS],
-            "a2_vol_ratio": A2_VOL_RATIO, "a_track_days": None, "a_track_unlimited": True, "b_kd_low": B_KD_LOW, "b_vol_ratio": B_VOL_RATIO,
+            "a2_vol_ratio": A2_VOL_RATIO, "a_track_days": None, "a_track_unlimited": True, "b_kd_low": B_KD_LOW, "b_vol_ratio": B_VOL_RATIO, "b_min_turnover": B_MIN_TURNOVER,
             "b_lowclose_pct": B_LOWCLOSE_PCT, "b_close_loc_min": B_CLOSE_LOC_MIN, "b_shrink_ratio": B_SHRINK_RATIO,
             "b_min_est_turnover": B_MIN_EST_TURNOVER, "b_wait_days": B_WAIT_DAYS, "regime_enter_bear_rounds": REGIME_ENTER_BEAR_ROUNDS,
             "regime_exit_hold_sec": REGIME_EXIT_HOLD_SEC, "r_blend": list(R_BLEND), "r_floor": R_FLOOR},
@@ -2976,7 +2979,9 @@ def build_night_message(init: dict, bases: dict, pools: dict, asof_str: str, ind
         need = B_MIN_EST_TURNOVER / B_SHRINK_RATIO / 1e8
         warns.append(f"B 池 {len(b_dead)}/{len(bc)} 檔在目前規則下不可能確認：B 確認要「預估量 ≤ B 訊號日量 × {B_SHRINK_RATIO:g}」又要「預估成交額 ≥ {B_MIN_EST_TURNOVER / 1e8:g} 億」，"
                      f"所以 B 訊號日成交額至少要約 {need:.1f} 億（{'、'.join(b_dead[:8])}{'…' if len(b_dead) > 8 else ''}）。"
-                     f"要讓 B 有機會觸發：調低 B_MIN_EST_TURNOVER，或把 B_MIN_TURNOVER 設成 ≥ {need:.1f} 億讓這類標的不進池")
+                     + (f"這幾檔是 B_MIN_TURNOVER（現為 {B_MIN_TURNOVER / 1e8:g} 億）生效前進池的，最多 {B_WAIT_DAYS} 個交易日後自然到期，新進池的標的不會再有這個問題"
+                        if B_MIN_TURNOVER >= need * 1e8 else
+                        f"要讓 B 有機會觸發：調低 B_MIN_EST_TURNOVER，或把 B_MIN_TURNOVER 設成 ≥ {need:.1f} 億讓這類標的不進池"))
     sections = [head]
     if warns:
         sections.append(["⚠️ <b>注意</b>"] + [f" • {w}" for w in warns])
@@ -3072,7 +3077,7 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
     sections.append([
         "   • <b>B 池轉折</b>(10:00起確認)：",
         "      1️⃣KD低檔金叉",
-        f"      2️⃣爆量≥{B_VOL_RATIO:g}x",
+        f"      2️⃣爆量≥{B_VOL_RATIO:g}x" + (f"、金額≥{B_MIN_TURNOVER / 1e8:g}億" if B_MIN_TURNOVER else ""),
         f"      3️⃣收盤≥{B_CLOSE_LOC_MIN * 100:.0f}%",
         f"      4️⃣守低、量縮≤{B_SHRINK_RATIO:g}、站MA5/VWAP、金額≥{B_MIN_EST_TURNOVER / 1e8:g}億"])
     sections.append([
