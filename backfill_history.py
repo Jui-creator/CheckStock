@@ -1,8 +1,8 @@
-"""一次性補歷史 backfill_history.py（v3）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
+"""一次性補歷史 backfill_history.py（v4）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
 並把每一次 A2 觸發（二次加碼）也重播出來寫進報表；最後順便做一次「收盤後選池」，直接產生明天要用的 initial_pools.json。
-這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70）。跑完不需要再跑。
-v3 跟著 v70 架構更新：
-  ① A1 追蹤 / A2 池的重播改用 v69.9 以後的移出規則（見下）；補進來的標的寫好 stage / pullback_days / a2（拉回天數與整理期均量），不用靠隔天重算。
+這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.2）。跑完不需要再跑。
+v4 跟著 v70.2 無期限 A1 追蹤規則更新：
+  ① A1 追蹤不再有 10 日到期：收盤 ≥ MA5 持續追蹤；MA10 ≤ 收盤 < MA5 進 A2；跌破 MA10 / 突破日低點，或 A2 拉回逾 6 日才移出。
   ② 不再叫你「接著手動跑 baseline」：選池已經搬到收盤後（radar），所以這支最後直接呼叫 radar.scan_core 產生 initial_pools.json（BACKFILL_NO_SCAN=1 可跳過）。
   ③ 範圍固定是全市場（B 池要全市場；約 37 分鐘），BACKFILL_ALL 不再需要。
   ④ 傍晚 16:30 以前富邦歷史日 K 還沒有今天：收盤後（13:35 之後）跑會自動用最終快照合成今天的 K 棒，和 radar 收盤後選池一樣。
@@ -15,7 +15,7 @@ v3 跟著 v70 架構更新：
     前一日收盤 ≤ 前一日 max(MA5/10/20)；收盤 > MA5/10/20（含當日收盤）；漲幅 > 2%；收盤 > 開盤；收盤 > 當日均價(成交額/成交量，當 VWAP 近似)；
     當日成交量 ≥ 前 5 日均量 × 1.5 且 ≥ 1,000 張；當日成交額 ≥ 30 億。（5 日均量 ≥ 1,000 張才納入）
   之後逐日套用追蹤規則（與 radar 13:35 結算一致）：收盤跌破 MA10 → 移出；收盤跌破突破日低點（= A1 當日最低價）→ 移出；
-    連續「收盤 < MA5」超過 A2_MAX_DAYS（6）天 → 移出（拉回逾 6 日未站回 MA5）；滿 10 個交易日而且當下不在拉回 → 移出；已在 A2 池（拉回中）的不受 10 天限制。
+    連續「收盤 < MA5」超過 A2_MAX_DAYS（6）天 → 移出（拉回逾 6 日未站回 MA5）；沒有固定追蹤期限。
     仍存活的：目前連續拉回 1～6 天 = A2 池，0 天 = A1 追蹤。
 【A2 觸發：日 K 近似重播（只是推估）】
   對每一筆 A1 收盤確認，在它還在追蹤池的每一天（含移出當天，因為盤中還在池內）逐日檢查：
@@ -37,7 +37,8 @@ from datetime import timedelta
 
 import radar as rd
 
-WINDOW = max(rd.B_WAIT_DAYS, rd.A_TRACK_DAYS)          # 往回重播的交易日數（10）
+B_WINDOW = rd.B_WAIT_DAYS + 5          # B 近期訊號 + 等待期，預設 10 個交易日
+REPORT_WINDOW = 10                      # 每日統計顯示最近 10 個交易日；A1 實際全區間重播
 REPORT_FILE = rd.BASE_DIR / "backfill_report.csv"
 
 TYPE_A_MEMBER = "A1收盤確認→進追蹤（日K推估）"
@@ -72,7 +73,7 @@ def trading_calendar(series: dict) -> list:
 # B 池重播（精確）
 # =========================
 def replay_b(series: dict, cal: list) -> list:
-    win = cal[-WINDOW:]
+    win = cal[-B_WINDOW:]
     out = []
     for code, s in series.items():
         pos = {d: i for i, d in enumerate(s["dates"])}
@@ -106,8 +107,9 @@ def replay_b(series: dict, cal: list) -> list:
 # A1（收盤確認）近似 → A1 追蹤 / A2 池成員重播
 # =========================
 def replay_a(series: dict, cal: list):
-    win = cal[-WINDOW:]
-    out, per_day = [], {d: 0 for d in win}
+    # A1 無固定期限，從有足夠 MA20 歷史的第一個可判斷日開始重播。
+    win = cal[21:]
+    out, per_day = [], {d: 0 for d in cal[-REPORT_WINDOW:]}
     for code, s in series.items():
         pos = {d: i for i, d in enumerate(s["dates"])}
         c, o, l, v, val = s["c"], s["o"], s["l"], s["v"], s["val"]
@@ -132,7 +134,8 @@ def replay_a(series: dict, cal: list):
                 continue
             if v[i] < rd.A1_VOL_RATIO * avg5 or v[i] < rd.A1_MIN_EST_LOTS or val[i] < rd.A_MIN_EST_TURNOVER:
                 continue
-            per_day[sd] += 1
+            if sd in per_day:
+                per_day[sd] += 1
             later = [d for d in cal if d > sd]
             status, end_day, why, n_pb = "alive", None, "", 0
             for k, t in enumerate(later, start=1):
@@ -148,9 +151,6 @@ def replay_a(series: dict, cal: list):
                 n_pb = (n_pb + 1) if c[j] < _mean(c[j - 4:j + 1]) else 0           # 連續「收盤 < MA5」的天數
                 if n_pb > rd.A2_MAX_DAYS:
                     status, end_day, why = "dead", t, f"拉回逾{rd.A2_MAX_DAYS}日未站回MA5"
-                    break
-                if k >= rd.A_TRACK_DAYS and n_pb == 0:
-                    status, end_day, why = "expired", t, f"追蹤滿{rd.A_TRACK_DAYS}日且已不在拉回"
                     break
             last = pos.get(cal[-1])
             out.append({"code": code, "name": s["name"], "market": s["market"], "signal_day": sd, "entry_price": c[i], "breakout_low": l[i],
@@ -168,7 +168,7 @@ def replay_a2_triggers(series: dict, cal: list, a_all: list):
     池內期間 = 訊號日之後、到移出當天為止（移出當天盤中仍在池內；alive 的到基準日）。
     整理天數用 radar.consolidation_run 以「前一天為止」的日 K 計算（與盤中用夜間資料的算法一致）。"""
     out, seen = [], set()
-    per_day = {d: 0 for d in cal[-WINDOW:]}
+    per_day = {d: 0 for d in cal[-REPORT_WINDOW:]}
     for r in sorted(a_all, key=lambda x: (x["signal_day"], x["code"])):
         s = series.get(r["code"])
         if s is None:
@@ -209,7 +209,7 @@ def replay_a2_triggers(series: dict, cal: list, a_all: list):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("一次性補歷史 backfill_history.py v3（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
+    print("一次性補歷史 backfill_history.py v4（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
     print("=" * 55, flush=True)
     force = _truthy("BACKFILL_FORCE")
     do_scan = not _truthy("BACKFILL_NO_SCAN")
@@ -256,13 +256,13 @@ def main() -> int:
     if not merged_today:
         print(f"[補歷史] 基準日 {asof}；{rd.normalize_units(feed, series, snap, asof)}", flush=True)
     cal = [d for d in trading_calendar(series) if d <= asof]
-    if len(cal) < WINDOW + 25:
-        msg = f"交易日曆只有 {len(cal)} 天，不夠重播（需要至少 {WINDOW + 25} 天）"
+    if len(cal) < 35:
+        msg = f"交易日曆只有 {len(cal)} 天，不夠重播（需要至少 35 天：MA20 暖機＋近期報表）"
         print(msg, flush=True)
         rd.send_telegram(f"❌ <b>【補歷史】</b> {msg}")
         return 1
     asof_str = asof.isoformat()
-    print(f"[補歷史] 交易日曆 {len(cal)} 天，重播最近 {WINDOW} 天：{cal[-WINDOW].isoformat()} ～ {asof_str}", flush=True)
+    print(f"[補歷史] 交易日曆 {len(cal)} 天；A1 從 {cal[21].isoformat()} 起全區間重播（無追蹤期限），B 重播最近 {B_WINDOW} 天：{cal[-B_WINDOW].isoformat()} ～ {asof_str}", flush=True)
     # ---- 重播 ----
     b_all = replay_b(series, cal)
     a_all, a_per_day = replay_a(series, cal)
@@ -270,7 +270,7 @@ def main() -> int:
     b_by_day = {}
     for r in b_all:
         b_by_day[r["signal_day"]] = b_by_day.get(r["signal_day"], 0) + 1
-    win = cal[-WINDOW:]
+    win = cal[-REPORT_WINDOW:]
     fmt_days = lambda m: "｜".join(f"{d.strftime('%m/%d')} {m.get(d, 0)}" for d in win)
     print("[B 訊號] 每天新出現檔數：" + fmt_days(b_by_day), flush=True)
     print("[A1 近似] 每天出現檔數：" + fmt_days(a_per_day), flush=True)
@@ -353,7 +353,7 @@ def main() -> int:
         w.writerows(rows)
     n_b_illiquid = sum(1 for r in latest_b.values() if not r["liquid"])
     n_a2 = sum(1 for st in stage_of.values() if st == "A2")
-    lines = [f"🧾 <b>【補歷史完成】</b> 基準日 {asof_str}｜重播最近 {WINDOW} 個交易日｜全市場 {len(series):,} 檔" + ("｜今天 K 棒由最終快照合成" if merged_today else ""),
+    lines = [f"🧾 <b>【補歷史完成】</b> 基準日 {asof_str}｜A1 全區間重播（無追蹤期限）｜每日統計最近 {REPORT_WINDOW} 日｜全市場 {len(series):,} 檔" + ("｜今天 K 棒由最終快照合成" if merged_today else ""),
              f"🔵 B：期間共出現 {len(b_all)} 次訊號 → 仍存活（Watching）{len(latest_b)} 檔，新增進 B 池 {added_b} 檔"
              + (f"（其中 5 日均量 < 1,000 張 {n_b_illiquid} 檔）" if n_b_illiquid else ""),
              "　每天新出現：" + fmt_days(b_by_day),
