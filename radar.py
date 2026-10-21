@@ -1,4 +1,4 @@
-"""飆股雷達 v70.5：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
+"""飆股雷達 v70.6：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
   08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
@@ -15,8 +15,9 @@
   （成交量比官方日 K 約少 1～2%：官方含盤後零股／定價；隔天預抓到的就是官方值，自動修正）。
 【市場趨勢：只有 NORMAL / BEAR 兩態（上市用加權、上櫃用櫃買，各自獨立）】
   即時月線 MA20 =（前 19 個完整交易日指數收盤 + 盤中即時指數）/ 20：前 19 日收盤收盤後算好存進 initial_pools.json（closes19），盤中每 15 秒用最新指數明確算出即時 MA20 再比較；
-  NORMAL：A1 預估量 ≥ 5 日均量 × 1.5（搭配同期量比）、A2 開放、B 開放。
-  BEAR  ：A1 預估量 ≥ 5 日均量 × 2.0（搭配同期量比）、A2 禁止、B 開放。
+  NORMAL：A1 預估量 ≥ 5 日均量 × 1.5（搭配同期量比）、A2 開放（量 ≥ 整理期均量 × 1.2）、B 開放。
+  BEAR  ：A1 預估量 ≥ 5 日均量 × A1_VOL_RATIO_BEAR（v70.6 = 1.5，不加嚴；實測 BEAR 下量比高低和收盤能不能站穩沒有關係，站不穩的由 13:35 收盤確認擋掉）、
+          A2 照常開放但量門檻提高為整理期均量 × A2_VOL_RATIO_BEAR（1.5）（v70.6 起不再停止；能進 A2 池的都已過 A1 收盤確認且守住 MA10 與突破日低點）、B 開放。
   切換防抖：NORMAL→BEAR 連續 2 輪低於即時月線；BEAR→NORMAL 站回即時月線並連續維持 5 分鐘；正式切換才 Telegram 通知一次。
   沒有 Hard Freeze，也沒有 DATA_ERROR_FREEZE。
 【A1 追蹤 / A2 池（v70.2 無固定追蹤期限）】A1 收盤確認成功後先進「A1 追蹤」；只要收盤 ≥ MA5 且守住突破日低點，就持續追蹤，不因天數到期移出。
@@ -26,7 +27,7 @@
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：站上三均線 N 日內（昨日以前連續站上不超過 N-1 天，N = A1_LATE_DAYS = 2）；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
       同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 20 億。
-  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 20 億；只在 NORMAL 發。
+  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5）；預估全日成交額 ≥ 20 億；NORMAL / BEAR 都發（v70.6）。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
 【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → 進 A1 追蹤；A1 追蹤 / A2 池依上面的規則移出；B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出
@@ -122,7 +123,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v70.5"
+RADAR_VERSION = "v70.6"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -157,7 +158,7 @@ A1_LATE_DAYS = 2                    # v70.3：站上三均線後第幾個交易�
                                     #   N = 2 → 站上當天，或站上後第 2 天（昨天剛好第一天收在三均線之上，今天才爆量也抓得到，例如 6672 9/23 站上、9/24 爆量）。
                                     #   「這一波」已經發過 A1（在 A1 追蹤 / A2 池、或待收盤確認）的不會在第 2 天重複發。
 A1_VOL_RATIO = 1.5                  # NORMAL：同期量比 ≥ 1.5（等價於預估全日量 ≥ 5 日均量 × 1.5）
-A1_VOL_RATIO_BEAR = 2.0             # BEAR：× 2.0
+A1_VOL_RATIO_BEAR = 1.5             # BEAR：v70.6 改成 1.5（和 NORMAL 一樣＝不加嚴）。2.0 是舊值；10/20 的實際紀錄 BEAR 下量比 5.9x 的兩檔收盤沒站穩、量比 2.0x 的反而站穩，量比高低和結果無關
 A1_MIN_EST_LOTS = 1000              # 預估全日成交量 ≥ 1,000 張
 A_MIN_EST_TURNOVER = 2_000_000_000  # 預估全日成交金額 ≥ 20 億（A1、A2 共用）
 VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
@@ -165,7 +166,8 @@ VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
 # ---- A2（二次加碼）----
 A2_ENABLED = True
 A2_MIN_DAYS, A2_MAX_DAYS = 1, 6     # 拉回整理：連續「收盤 < MA5 且 ≥ MA10 且 ≥ 突破日低點」1～6 天
-A2_VOL_RATIO = 1.2                  # 預估全日量 ≥ 整理期平均量 × 1.2
+A2_VOL_RATIO = 1.2                  # NORMAL：預估全日量 ≥ 整理期平均量 × 1.2
+A2_VOL_RATIO_BEAR = 1.5             # v70.6：BEAR 時 A2 不再停止，量門檻提高為整理期平均量 × 1.5（弱勢盤要求更明確的量能）
 A2_REQUIRE_VWAP = True              # 現價 > 即時 VWAP
 A2_REQUIRE_ALL_MAS = True           # False = 只要現價 > 即時 MA5（你確認過的規則）；True = 現價必須同時 > 即時 MA5、MA10、MA20（「重新站回所有均線」）
 # v70.2：A1 追蹤不設固定天數上限。階段完全由收盤相對 MA5 / MA10 與突破日低點決定。
@@ -1070,7 +1072,7 @@ def a1_stage(base: dict, price, open_, chg, mas, vwap, est, mode: str):
         return "vwap"
     if est is None:
         return "vol"
-    ratio = A1_VOL_RATIO_BEAR if mode == "BEAR" else A1_VOL_RATIO
+    ratio = a1_vol_need(mode)
     if est["sync_ratio"] is None or est["sync_ratio"] < ratio or est["est_vol"] < A1_MIN_EST_LOTS:
         return "vol"
     if est["est_val"] < A_MIN_EST_TURNOVER:
@@ -1147,9 +1149,19 @@ def apply_a_stages(pools: dict, bases: dict, day_str: str = None) -> dict:
     return {"a1": n_a1, "a2": n_a2, "removed": n_out}
 
 
+def a1_vol_need(mode: str) -> float:
+    """A1 同期量比門檻：BEAR 用 A1_VOL_RATIO_BEAR，其餘用 A1_VOL_RATIO。"""
+    return A1_VOL_RATIO_BEAR if mode == "BEAR" else A1_VOL_RATIO
+
+
+def a2_vol_need(mode: str) -> float:
+    """A2 量門檻（× 整理期平均量）：BEAR 用 A2_VOL_RATIO_BEAR，其餘用 A2_VOL_RATIO。"""
+    return A2_VOL_RATIO_BEAR if mode == "BEAR" else A2_VOL_RATIO
+
+
 def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
-    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日金額 ≥ 20 億。只在 NORMAL 發。"""
-    if mode != "NORMAL" or not a2 or not a2.get("n") or not a2.get("avg_vol"):
+    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5，v70.6 起 BEAR 不再停止 A2）；預估全日金額 ≥ 20 億。只在 NORMAL 發。"""
+    if not a2 or not a2.get("n") or not a2.get("avg_vol"):
         return "none"
     if not (A2_MIN_DAYS <= a2["n"] <= A2_MAX_DAYS):
         return "days"
@@ -1163,7 +1175,7 @@ def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
         return "vwap"
     if est is None:
         return "vol"
-    if est["est_vol"] < a2["avg_vol"] * A2_VOL_RATIO:
+    if est["est_vol"] < a2["avg_vol"] * a2_vol_need(mode):
         return "vol"
     if est["est_val"] < A_MIN_EST_TURNOVER:
         return "turn"
@@ -2640,7 +2652,7 @@ def assemble_initial_pools(bases: dict, pools: dict, asof_iso: str, index_ctx: d
         "indicator_parameters": {
             "min_vol5_lots": MIN_VOL5_LOTS, "a1_chg_min": A1_CHG_MIN, "a1_late_days": A1_LATE_DAYS, "a1_vol_ratio": A1_VOL_RATIO, "a1_vol_ratio_bear": A1_VOL_RATIO_BEAR,
             "a1_min_est_lots": A1_MIN_EST_LOTS, "a_min_est_turnover": A_MIN_EST_TURNOVER, "a2_days": [A2_MIN_DAYS, A2_MAX_DAYS],
-            "a2_vol_ratio": A2_VOL_RATIO, "a_track_days": None, "a_track_unlimited": True, "b_kd_low": B_KD_LOW, "b_vol_ratio": B_VOL_RATIO, "b_min_turnover": B_MIN_TURNOVER,
+            "a2_vol_ratio": A2_VOL_RATIO, "a2_vol_ratio_bear": A2_VOL_RATIO_BEAR, "a_track_days": None, "a_track_unlimited": True, "b_kd_low": B_KD_LOW, "b_vol_ratio": B_VOL_RATIO, "b_min_turnover": B_MIN_TURNOVER,
             "b_lowclose_pct": B_LOWCLOSE_PCT, "b_close_loc_min": B_CLOSE_LOC_MIN, "b_shrink_ratio": B_SHRINK_RATIO,
             "b_min_est_turnover": B_MIN_EST_TURNOVER, "b_wait_days": B_WAIT_DAYS, "regime_enter_bear_rounds": REGIME_ENTER_BEAR_ROUNDS,
             "regime_exit_hold_sec": REGIME_EXIT_HOLD_SEC, "r_blend": list(R_BLEND), "r_floor": R_FLOOR},
@@ -2743,17 +2755,17 @@ def inst_line(inst5) -> list:
 
 
 def bear_line(sig) -> list:
-    return [f"⚠️ <b>大盤空頭（BEAR）</b>：A1 同期量比門檻提高為 {A1_VOL_RATIO_BEAR:g} 倍"] if sig.get("mode") == "BEAR" else []
+    return [f"⚠️ <b>大盤空頭（BEAR）</b>：A1 同期量比門檻 {A1_VOL_RATIO_BEAR:g} 倍" + ("（比平常提高）" if A1_VOL_RATIO_BEAR > A1_VOL_RATIO else "（不加嚴）")] if sig.get("mode") == "BEAR" else []
 
 
 def build_a1_message(sig: dict, n_today: int, now: datetime) -> str:
     """【A1：首發突破】一則訊息一檔股票（v69.7 版面）。不附停損價（停損你自己處理）。盤中通知；收盤站穩三均線才會進 A1 追蹤。"""
     t_now = now.strftime("%H:%M:%S")
     est = sig["est"]
-    need = A1_VOL_RATIO_BEAR if sig.get("mode") == "BEAR" else A1_VOL_RATIO
+    need = a1_vol_need(sig.get("mode"))
     lines = [f"<b>【A1：首發突破】</b> <b>{sig['code']} {sig['name']}</b>"]
     if sig.get("mode") == "BEAR":
-        lines.append(f"🔴 <b>大盤空頭</b>：同期量比提高為 {A1_VOL_RATIO_BEAR:g} 倍")
+        lines.append(f"🔴 <b>大盤空頭</b>：同期量比提高為 {A1_VOL_RATIO_BEAR:g} 倍" if A1_VOL_RATIO_BEAR > A1_VOL_RATIO else f"🔴 <b>大盤空頭</b>：A1 量比門檻不加嚴（{A1_VOL_RATIO_BEAR:g} 倍）；收盤沒站穩三均線不會進追蹤")
     if (sig.get("above_days") or 0) >= 1 and sig.get("above_days") != 99:
         lines.append(f"🕐 <b>站上三均線第 {sig['above_days'] + 1} 天首次放量</b>（昨天已收在三均線之上）")
     lines += [
@@ -2782,7 +2794,10 @@ def build_a2_message(sig: dict, n_today: int, now: datetime) -> str:
     t_now = now.strftime("%H:%M:%S")
     est = sig["est"]
     chg_since = _pc((sig["price"] / sig["entry_price"] - 1) * 100.0) if sig.get("entry_price") else "—"
-    lines = [f"🟡 <b>【A2：二次加碼】</b> <b>{sig['code']} {sig['name']}</b>",
+    lines = [f"🟡 <b>【A2：二次加碼】</b> <b>{sig['code']} {sig['name']}</b>"]
+    if sig.get("mode") == "BEAR":
+        lines.append(f"🔴 <b>大盤空頭（BEAR）</b>：A2 照常，量門檻提高為整理期均量 {A2_VOL_RATIO_BEAR:g} 倍，請自行控管部位")
+    lines += [
              f"💡 <b>再發動：</b>A1 收盤確認後進 A2 池：拉回整理 {sig['consol_days']} 天（收盤 < MA5、守住 MA10 與突破日低點），今日現價重新站上即時 MA5"
              + ("、MA10、MA20" if A2_REQUIRE_ALL_MAS else ""),
              "━━━━━━━━━━━━━━━",
@@ -2792,7 +2807,7 @@ def build_a2_message(sig: dict, n_today: int, now: datetime) -> str:
              f"▫️ <b>整理期：</b>{sig['consol_days']} 天（{A2_MIN_DAYS}～{A2_MAX_DAYS} 天）｜平均量 {sig['consol_avg_vol']:,.0f} 張",
              f"▫️ <b>VWAP：</b>{_p2(sig.get('vwap'))}（現價高於 {_pc(sig.get('vwap_pct'))}）✅",
              f"▫️ <b>低點：</b>今日最低 {_p2(sig.get('low'))} ≥ 突破日低點 ✅",
-             f"▫️ <b>量能：</b>預估全日量 {est['est_vol']:,.0f} 張 = 整理期平均量的 <b>{sig['est_ratio']:.2f}x</b>（≥ {A2_VOL_RATIO:g}x）✅",
+             f"▫️ <b>量能：</b>預估全日量 {est['est_vol']:,.0f} 張 = 整理期平均量的 <b>{sig['est_ratio']:.2f}x</b>（≥ {a2_vol_need(sig.get('mode')):g}x）✅",
              f"▫️ <b>成交額：</b>預估全日 <b>{est['est_val'] / 1e8:.2f} 億</b>（≥ {A_MIN_EST_TURNOVER / 1e8:g} 億）✅"]
     lines += inst_line(sig.get("inst5"))
     lines += ["", "🏷️ <b>【其他資訊】</b>", f"▫️ <b>族群：</b>{_short(sig.get('industry'))}",
@@ -2833,9 +2848,9 @@ def build_regime_message(ev: str, w, now: datetime) -> str:
     ma = f"{w.last_ma20:,.2f}" if w.last_ma20 is not None else "—"
     if ev == "TO_BEAR":
         return (f"🔴 <b>【市場趨勢：空頭 BEAR】</b> {t_now}\n{w.name} 連續 {REGIME_ENTER_BEAR_ROUNDS} 輪低於盤中即時月線"
-                f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 同期量比門檻提高為 {A1_VOL_RATIO_BEAR:g} 倍｜A2 禁止｜B 照常（{w.name} 對應的{'上市' if w.name == '加權' else '上櫃'}個股）")
+                f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 同期量比門檻 {A1_VOL_RATIO_BEAR:g} 倍{'（提高）' if A1_VOL_RATIO_BEAR > A1_VOL_RATIO else '（不加嚴）'}｜A2 照常，量門檻提高為整理期均量 {A2_VOL_RATIO_BEAR:g} 倍｜B 照常（{w.name} 對應的{'上市' if w.name == '加權' else '上櫃'}個股）")
     return (f"🟢 <b>【市場趨勢：多頭 NORMAL】</b> {t_now}\n{w.name} 站回盤中即時月線並連續維持 {REGIME_EXIT_HOLD_SEC // 60} 分鐘"
-            f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 門檻回到 {A1_VOL_RATIO:g} 倍｜A2 恢復開放｜B 照常")
+            f"（現 {cur}｜即時 MA20 {ma}｜穿越價 {w.p:,.2f}）\nA1 門檻 {A1_VOL_RATIO:g} 倍｜A2 量門檻回到 {A2_VOL_RATIO:g} 倍｜B 照常")
 
 
 # ---------- 盤後總結（v69.8：A1 追蹤 / A2 池 / B 池合併成一則）----------
@@ -3065,14 +3080,14 @@ def build_startup_message(init: dict, init_note: str, regime, pools: dict, pool_
         "   • <b>A1 突破</b>：",
         f"      1️⃣站上 MA5/10/20（站上{A1_LATE_DAYS}日內）",
         f"      2️⃣漲>{A1_CHG_MIN:g}% ＋ 紅K ＋ 現價>VWAP",
-        f"      3️⃣量比≥{A1_VOL_RATIO:g} (BEAR 需量比≥{A1_VOL_RATIO_BEAR:g})",
+        f"      3️⃣量比≥{A1_VOL_RATIO:g}" + (f" (BEAR 需量比≥{A1_VOL_RATIO_BEAR:g})" if A1_VOL_RATIO_BEAR != A1_VOL_RATIO else ""),
         f"      4️⃣預估量≥{A1_MIN_EST_LOTS:,}張",
         f"      5️⃣金額≥{A_MIN_EST_TURNOVER / 1e8:g}億"])
     sections.append([
-        "   • <b>A2 回檔</b> (🐻 BEAR 停止觸發)：",
+        "   • <b>A2 回檔</b>：",
         "      1️⃣跌破MA5守住MA10與低點",
         f"      2️⃣{A2_MIN_DAYS}~{A2_MAX_DAYS}日內重站回{ma_txt}與VWAP",
-        f"      3️⃣量≥{A2_VOL_RATIO:g}倍",
+        f"      3️⃣量≥{A2_VOL_RATIO:g}倍 (BEAR {A2_VOL_RATIO_BEAR:g}倍)",
         f"      4️⃣金額≥{A_MIN_EST_TURNOVER / 1e8:g}億"])
     sections.append([
         "   • <b>B 池轉折</b>(10:00起確認)：",
