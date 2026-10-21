@@ -25,8 +25,8 @@
 【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 爆量日成交額 ≥ 15 億（B_MIN_TURNOVER）＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：站上三均線 N 日內（昨日以前連續站上不超過 N-1 天，N = A1_LATE_DAYS = 2）；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
-      同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 30 億。
-  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 30 億；只在 NORMAL 發。
+      同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 20 億。
+  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日成交額 ≥ 20 億；只在 NORMAL 發。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
 【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → 進 A1 追蹤；A1 追蹤 / A2 池依上面的規則移出；B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出
@@ -159,7 +159,7 @@ A1_LATE_DAYS = 2                    # v70.3：站上三均線後第幾個交易�
 A1_VOL_RATIO = 1.5                  # NORMAL：同期量比 ≥ 1.5（等價於預估全日量 ≥ 5 日均量 × 1.5）
 A1_VOL_RATIO_BEAR = 2.0             # BEAR：× 2.0
 A1_MIN_EST_LOTS = 1000              # 預估全日成交量 ≥ 1,000 張
-A_MIN_EST_TURNOVER = 2_000_000_000  # 預估全日成交金額 ≥ 30 億（A1、A2 共用）
+A_MIN_EST_TURNOVER = 2_000_000_000  # 預估全日成交金額 ≥ 20 億（A1、A2 共用）
 VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
 
 # ---- A2（二次加碼）----
@@ -1148,7 +1148,7 @@ def apply_a_stages(pools: dict, bases: dict, day_str: str = None) -> dict:
 
 
 def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
-    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日金額 ≥ 30 億。只在 NORMAL 發。"""
+    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2；預估全日金額 ≥ 20 億。只在 NORMAL 發。"""
     if mode != "NORMAL" or not a2 or not a2.get("n") or not a2.get("avg_vol"):
         return "none"
     if not (A2_MIN_DAYS <= a2["n"] <= A2_MAX_DAYS):
