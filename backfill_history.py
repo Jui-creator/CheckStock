@@ -1,6 +1,7 @@
-"""一次性補歷史 backfill_history.py（v5.3）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
+"""一次性補歷史 backfill_history.py（v5.4）：用富邦日 K 往回重播，替 signal_history.json 補上「今天以前」已經存在的 B 池與 A1 追蹤 / A2 池，
 並把每一次 A2 觸發（二次加碼）也重播出來寫進報表；最後順便做一次「收盤後選池」，直接產生明天要用的 initial_pools.json。
 這是上線時只跑一次的作業，不放在 baseline.py / radar.py 裡；需要同資料夾的 radar.py（v70.2）。跑完不需要再跑。
+v5.4：跟著 radar v70.6：BEAR 時 A2 不再停止（量門檻 1.5 倍）。補歷史的 A2 觸發重播沒有 BEAR 判斷，一律用 NORMAL 的 1.2 倍，空頭期間會偏寬鬆。
 v5.3：B 重播跟著 radar v70.5（B_MIN_TURNOVER = 15 億，爆量日成交額不足的不計入 B 訊號）；A1 / A2 邏輯不變。
 v5.2：重複執行（BACKFILL_FORCE=1）不再把同一批「補歷史」移出紀錄一直累加進 closed（radar.save_pools 會依 池／代號／日期／原因／進場日 去重，並順手清掉舊檔裡已經累積的重複）。
 v5.1 新增「只重跑選池」模式（BACKFILL_RESCAN_ONLY=1，workflow 勾 rescan_only）：
@@ -32,7 +33,7 @@ v4 跟著 v70.2 無期限 A1 追蹤規則更新：
     ② 當天最低價 ≥ 突破日低點；③ 當天收盤 > MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20，含當日收盤）；④ 當天收盤 > 當日均價（VWAP 近似）
     ⑤ 當天成交量 ≥ 整理期平均量 × A2_VOL_RATIO（1.2）；⑥ 當天成交額 ≥ 20 億
   全部成立就記一筆「A2觸發(日K推估)」。同一檔同一天只記一筆（不同 A1 訊號重疊時取較早的那筆）。
-  限制：沒有 BEAR（A2 在空頭禁止）的判斷；成交量用「實際全日量」而不是盤中預估量，所以會比實盤寬鬆（偏樂觀）；
+  限制：沒有 BEAR 的判斷（BEAR 時 A2 量門檻是 1.5 倍，這裡一律 1.2 倍）；成交量用「實際全日量」而不是盤中預估量，所以會比實盤寬鬆（偏樂觀）；
         沒有真正的「連續 2 輪」二次確認；通知價用收盤價近似。補進去的標的 src = "backfill"、origin = "A1_CLOSE_CONFIRMED"。
 安全：signal_history.json 已有內容時預設中止；BACKFILL_FORCE=1 才會執行，且只「新增」不存在的代號，不覆蓋既有資料。
 環境變數：FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS、TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、BACKFILL_RESCAN_ONLY=1、BACKFILL_FORCE=1、BACKFILL_NO_SCAN=1（只補 signal_history.json，不做收盤後選池）
@@ -223,7 +224,7 @@ def replay_a2_triggers(series: dict, cal: list, a_all: list):
 
 def main() -> int:
     print("=" * 55, flush=True)
-    print("一次性補歷史 backfill_history.py v5.3（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
+    print("一次性補歷史 backfill_history.py v5.4（日 K 重播 → signal_history.json → 收盤後選池 → initial_pools.json）", flush=True)
     print("=" * 55, flush=True)
     force = _truthy("BACKFILL_FORCE")
     do_scan = not _truthy("BACKFILL_NO_SCAN")
