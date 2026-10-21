@@ -159,7 +159,7 @@ A1_LATE_DAYS = 2                    # v70.3：站上三均線後第幾個交易�
 A1_VOL_RATIO = 1.5                  # NORMAL：同期量比 ≥ 1.5（等價於預估全日量 ≥ 5 日均量 × 1.5）
 A1_VOL_RATIO_BEAR = 2.0             # BEAR：× 2.0
 A1_MIN_EST_LOTS = 1000              # 預估全日成交量 ≥ 1,000 張
-A_MIN_EST_TURNOVER = 3_000_000_000  # 預估全日成交金額 ≥ 30 億（A1、A2 共用）
+A_MIN_EST_TURNOVER = 2_000_000_000  # 預估全日成交金額 ≥ 30 億（A1、A2 共用）
 VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
 
 # ---- A2（二次加碼）----
