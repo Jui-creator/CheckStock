@@ -1,4 +1,4 @@
-"""飆股雷達 v70.6：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
+"""飆股雷達 v70.7：A1 首發突破 / A2 二次加碼 / B 跌深低接（依 2026-10-17「程式選股新架構」；v70 起「選池」搬到收盤後，baseline 只算法人）。
 價格與行情全部來自富邦 Neo API；法人買賣超用證交所＋櫃買官方資料（只當參考，不當篩選條件）。停損由你自己處理：不監控停損、不發停損通知。
 【一天的流程（v70）】Google Apps Script 以 workflow_dispatch 呼叫兩條 workflow（GitHub 本身不設 cron）：
   08:00~09:00  daily.yml    → radar.py    ：盤前載入 → 背景預抓全市場日 K → 盤中 15 秒掃描 → 13:35 結算 → 【收盤後選池】→ 寫 initial_pools.json（明天用）
@@ -26,14 +26,17 @@
 【B 候選池】全市場，不篩 5 日均量：KD(9,3,3) 前日 K≤D、當日 K>D 且 K<40 ＋ 成交量 ≥ 前 20 日均量 × 2 ＋ 爆量日成交額 ≥ 15 億（B_MIN_TURNOVER）＋ 收盤 ≥ 最低價 × 1.02 ＋ 收盤位置 ≥ 60%。
 【盤中（radar.py）】09:05~13:24:45 每 15 秒一輪，連續 2 輪符合才通知；13:25 起停止所有新的個股訊號。
   A1：站上三均線 N 日內（昨日以前連續站上不超過 N-1 天，N = A1_LATE_DAYS = 2）；現價同時站上盤中即時 MA5/10/20；漲幅 > 2%；現價 > 開盤價；現價 > 即時 VWAP；預估全日量 ≥ 1,000 張；
-      同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 20 億。
-  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5）；預估全日成交額 ≥ 20 億；NORMAL / BEAR 都發（v70.6）。
+      同期量比 ≥ 1.5（BEAR 2.0；等價於預估全日量 ≥ 5 日均量 × 倍數）；預估全日成交額 ≥ 25 億。
+  A2：僅 A2 池內；今日最低價 ≥ 突破日低點；現價 > 即時 MA5（A2_REQUIRE_ALL_MAS = True 時還要 > MA10、MA20）且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5）；預估全日成交額 ≥ 25 億；NORMAL / BEAR 都發（v70.6）。
   B ：10:00 後；今日最低價 ≥ B 訊號日最低價；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≤ B 訊號日量 × 0.6；預估全日成交額 ≥ 5 億；NORMAL / BEAR 都發。
   通知優先序 A2 > A1 > B；同一檔同一天只發一種主訊號（ONE_SIGNAL_PER_STOCK）。A1 與 B 候選池可以重疊，沒有 B→A1 升級。
 【13:35 收盤結算】用富邦最終快照（closePrice 且非試撮）；A1 收盤確認 → 進 A1 追蹤；A1 追蹤 / A2 池依上面的規則移出；B 每過一個交易日 waiting_days+1，第 5 個交易日收盤仍未發動 → B_EXPIRED 移出
   （不發停損／出場通知）；寫 signal_history.json、pool_report.csv。結算完接著「收盤後選池」；選池成功才發【盤後運算】（取代舊的 13:35 盤後總結，避免同一天通知兩次池）；選池失敗才補發盤後總結＋警告。
 【檔案】initial_pools.json（收盤後選池產出，隔天盤中唯讀）、institutional.json（baseline 傍晚產出，radar 盤前讀）、signal_history.json（追蹤清單）、
         stock_states.json（當日已通知名單＋趨勢狀態＋執行鎖）、pool_report.csv
+【Telegram 發送（v70.7）】① 回應逾時（ReadTimeout）不再重送：請求其實已經送到 Telegram，只是回應沒回來，重送會變成重複通知（10/22 濱川 A1 因此重複 3 則）；
+  只有「確定沒送出」（連不上、被限速 429、HTML 格式被拒）才重試。② 個股通知改在背景執行緒送出，不再卡住 15 秒一輪的盤中掃描（卡住時兩輪間隔拉長，「連續 2 輪確認」會被重算）。
+  ③ 每輪結束前、13:25 收盤前都會等通知佇列送完。
 【環境變數】TELEGRAM_TOKEN、TELEGRAM_CHAT_ID、FUBON_ID、FUBON_API_KEY、FUBON_CERT_PASS（憑證 fubon.p12；可用 FUBON_CERT_PATH 改路徑）、DEBUG_CODES=2330,2317（可選）
 """
 import os
@@ -43,6 +46,7 @@ import sys
 import json
 import time
 import html
+import queue
 import asyncio
 import pathlib
 import threading
@@ -65,6 +69,9 @@ IC_CACHE_FILE = BASE_DIR / "ic_sector_cache.json"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_API = "https://api.telegram.org"
+TELEGRAM_TIMEOUT = (10, 30)         # (連線逾時, 讀取逾時) 秒；個股通知在背景送出，讀取逾時放寬到 30 秒也不會卡住盤中掃描
+TELEGRAM_DOC_TIMEOUT = (10, 60)
 FUBON_CERT_PATH = os.environ.get("FUBON_CERT_PATH", "fubon.p12")
 DEBUG_STOCK_CODES = {c.strip() for c in os.environ.get("DEBUG_CODES", "").split(",") if c.strip()}
 
@@ -123,7 +130,7 @@ ALERT_QUEUE = []
 # =========================
 # v69 參數（全部集中在這裡；要調規則只改這一段）
 # =========================
-RADAR_VERSION = "v70.6"
+RADAR_VERSION = "v70.7"
 INITIAL_RULE = "v69"                # initial_pools.json 的規則版本；舊版檔案會被拒用
 POOL_RULE = "q2"                    # signal_history.json 規則版本（q1 會自動升級）
 POOL_RULES_OK = ("q1", "q2")
@@ -160,7 +167,7 @@ A1_LATE_DAYS = 2                    # v70.3：站上三均線後第幾個交易�
 A1_VOL_RATIO = 1.5                  # NORMAL：同期量比 ≥ 1.5（等價於預估全日量 ≥ 5 日均量 × 1.5）
 A1_VOL_RATIO_BEAR = 1.5             # BEAR：v70.6 改成 1.5（和 NORMAL 一樣＝不加嚴）。2.0 是舊值；10/20 的實際紀錄 BEAR 下量比 5.9x 的兩檔收盤沒站穩、量比 2.0x 的反而站穩，量比高低和結果無關
 A1_MIN_EST_LOTS = 1000              # 預估全日成交量 ≥ 1,000 張
-A_MIN_EST_TURNOVER = 2_000_000_000  # 預估全日成交金額 ≥ 20 億（A1、A2 共用）
+A_MIN_EST_TURNOVER = 2_500_000_000  # 預估全日成交金額 ≥ 25 億（A1、A2 共用）
 VWAP_FILTER = True                  # 現價 > 即時 VWAP（硬條件）
 
 # ---- A2（二次加碼）----
@@ -309,24 +316,64 @@ def _safe_html(text: str) -> str:
     return text
 
 
+def _telegram_not_sent(exc) -> bool:
+    """例外發生時，「確定請求還沒送到 Telegram」→ 才可以安全重試（不會造成重複通知）。
+    連線逾時、連不上伺服器、DNS 失敗 = 沒送出；讀取逾時（ReadTimeout）、連線被中斷 = 請求可能已經送達，只是回應沒回來 → 不能重送。"""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError) and not isinstance(exc, requests.exceptions.ReadTimeout):
+        text = repr(exc)
+        return any(k in text for k in ("NewConnectionError", "Failed to establish", "Name or service not known",
+                                       "Temporary failure in name resolution", "ConnectTimeoutError", "Network is unreachable"))
+    return False
+
+
+def _retry_after(response) -> float:
+    try:
+        return float(((response.json() or {}).get("parameters") or {}).get("retry_after") or 3)
+    except Exception:
+        return 3.0
+
+
 def _send_telegram_chunk(message: str, retry: int = 3) -> bool:
+    """送一則。重試規則（避免重複通知）：只有確定沒送出才重送——連不上（ConnectTimeout / 連線失敗）、HTTP 429（依 retry_after 等待）、
+    HTTP 400 HTML 格式被拒（改用純文字送一次）。讀取逾時 / 連線中斷 / HTTP 5xx：訊息可能已經送達，不重送，只在 log 留記錄。"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[模擬 Telegram]\n{message}", flush=True)
         return True
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _safe_html(message), "parse_mode": "HTML"}
+    plain_tried = False
     for attempt in range(1, retry + 1):
         try:
-            response = requests.post(
-                url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": _safe_html(message), "parse_mode": "HTML"},
-                timeout=15,
-            )
-            if response.status_code == 200:
-                return True
-            print(f"Telegram HTTP={response.status_code}: {response.text[:200]}", flush=True)
+            response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
         except Exception as exc:
-            print(f"Telegram 第{attempt}次失敗: {type(exc).__name__}: {repr(exc)}", flush=True)
-        time.sleep(2 * attempt)
+            if _telegram_not_sent(exc):
+                print(f"Telegram 第{attempt}次連線失敗（請求沒有送出，可以重試）: {type(exc).__name__}", flush=True)
+                if attempt < retry:
+                    time.sleep(2 * attempt)
+                continue
+            print(f"Telegram 回應逾時或中斷（{type(exc).__name__}）：訊息可能已經送達，為避免重複通知不重送。請到 Telegram 確認這一則有沒有收到", flush=True)
+            return False
+        if response.status_code == 200:
+            return True
+        print(f"Telegram HTTP={response.status_code}: {response.text[:200]}", flush=True)
+        if response.status_code == 429:
+            wait = min(_retry_after(response), 30.0) + 1.0
+            print(f"Telegram 被限速（429），{wait:.0f} 秒後重送（沒送出，不會重複）", flush=True)
+            if attempt < retry:
+                time.sleep(wait)
+            continue
+        if response.status_code == 400 and not plain_tried and "parse" in response.text.lower():
+            plain_tried = True                                    # HTML 格式被拒 = 沒送出：去掉標籤改用純文字再送一次，避免整則通知消失
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": re.sub(r"</?(?:b|code)>", "", message)}
+            print("Telegram 拒絕 HTML 格式，改用純文字重送", flush=True)
+            continue
+        if response.status_code >= 500:
+            print("Telegram 伺服器錯誤（5xx）：訊息可能已經送達，不重送", flush=True)
+            return False
+        if attempt < retry:
+            time.sleep(2 * attempt)
     return False
 
 
@@ -362,7 +409,7 @@ def send_telegram_document(path: pathlib.Path, caption: str = "", retry: int = 3
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[模擬 Telegram 傳檔] {path.name}｜{caption}", flush=True)
         return True
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendDocument"
     for attempt in range(1, retry + 1):
         try:
             with path.open("rb") as fh:
@@ -370,13 +417,21 @@ def send_telegram_document(path: pathlib.Path, caption: str = "", retry: int = 3
                     url,
                     data={"chat_id": TELEGRAM_CHAT_ID, "caption": _safe_html(caption), "parse_mode": "HTML"},
                     files={"document": (path.name, fh, "text/csv")},
-                    timeout=45,
+                    timeout=TELEGRAM_DOC_TIMEOUT,
                 )
             if response.status_code == 200:
                 return True
             print(f"Telegram 傳檔 HTTP={response.status_code}: {response.text[:200]}", flush=True)
+            if response.status_code >= 500:
+                return False                                  # 可能已送達，不重送
+            if response.status_code == 429:
+                time.sleep(min(_retry_after(response), 30.0) + 1.0)
+                continue
         except Exception as exc:
-            print(f"Telegram 傳檔第{attempt}次失敗: {type(exc).__name__}: {repr(exc)}", flush=True)
+            if not _telegram_not_sent(exc):
+                print(f"Telegram 傳檔回應逾時或中斷（{type(exc).__name__}）：檔案可能已經送達，不重送", flush=True)
+                return False
+            print(f"Telegram 傳檔第{attempt}次連線失敗（沒有送出，重試）: {type(exc).__name__}", flush=True)
         time.sleep(2 * attempt)
     return False
 
@@ -388,14 +443,59 @@ def enqueue_alert(message: str) -> None:
 ALERT_SEND_GAP = 1.0                 # 兩則個股通知之間間隔（秒），避免 Telegram 同一聊天室每秒限 1 則的限制
 
 
+class AlertSender:
+    """個股通知（A1 / A2 / B / 趨勢切換）的背景發送器：一個執行緒、一個佇列、依序送出、兩則間隔 ALERT_SEND_GAP 秒。
+    盤中主迴圈只管把訊息放進佇列就繼續下一輪，不會被 Telegram 的網路延遲卡住（v70.6 以前同步送出，一次逾時就卡 15～50 秒，
+    兩輪間隔超過 CONFIRM_MAX_GAP_SECONDS（45 秒）時「連續 2 輪確認」還會被重算）。"""
+
+    def __init__(self, gap: float):
+        self.gap = gap
+        self.q = queue.Queue()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="alert-sender", daemon=True)
+                self._thread.start()
+
+    def put(self, msg: str) -> None:
+        self._ensure()
+        self.q.put(msg)
+
+    def _run(self) -> None:
+        while True:
+            msg = self.q.get()
+            try:
+                send_telegram(msg)
+            except Exception as exc:                          # 任何例外都不能讓發送執行緒中斷
+                print(f"[通知佇列] 發送例外：{type(exc).__name__}: {exc}", flush=True)
+            finally:
+                self.q.task_done()
+            time.sleep(self.gap)
+
+    def pending(self) -> int:
+        return self.q.unfinished_tasks
+
+    def drain(self, timeout: float = 90.0) -> bool:
+        """等佇列送完（最多 timeout 秒）。回傳是否已清空。"""
+        end = time.time() + timeout
+        while self.q.unfinished_tasks and time.time() < end:
+            time.sleep(0.2)
+        return self.q.unfinished_tasks == 0
+
+
+ALERT_SENDER = AlertSender(ALERT_SEND_GAP)
+
+
 async def flush_alerts(loop) -> None:
-    """一檔一則：佇列裡每則訊息獨立送出，不合併。"""
+    """一檔一則：佇列裡每則訊息獨立送出，不合併。只負責「交給背景發送器」，立刻返回，不等 Telegram 回應。"""
     if not ALERT_QUEUE:
         return
     batch, ALERT_QUEUE[:] = ALERT_QUEUE[:], []
     for msg in batch:
-        await loop.run_in_executor(None, send_telegram, msg)
-        await asyncio.sleep(ALERT_SEND_GAP)
+        ALERT_SENDER.put(msg)
 
 
 # =========================
@@ -1160,7 +1260,7 @@ def a2_vol_need(mode: str) -> float:
 
 
 def a2_stage(a2: dict, floor_low, price, day_low, mas, vwap, est, mode: str):
-    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5，v70.6 起 BEAR 不再停止 A2）；預估全日金額 ≥ 20 億。只在 NORMAL 發。"""
+    """A2：整理期 A2_MIN_DAYS～A2_MAX_DAYS 天（目前 1～6）；今日最低價 ≥ 突破日低點；現價 > 即時 MA5 且 > 即時 VWAP；預估全日量 ≥ 整理期平均量 × 1.2（BEAR 時 1.5，v70.6 起 BEAR 不再停止 A2）；預估全日金額 ≥ 25 億。只在 NORMAL 發。"""
     if not a2 or not a2.get("n") or not a2.get("avg_vol"):
         return "none"
     if not (A2_MIN_DAYS <= a2["n"] <= A2_MAX_DAYS):
@@ -3777,7 +3877,7 @@ async def main_async() -> None:
             trend_txt = "｜".join(f"{w.name} {w.state} 現 {w.last_reading:,.2f} / 即時MA20 {w.last_ma20:,.2f}"
                                   for w in regime.w.values() if w.last_reading is not None and w.last_ma20 is not None)
             print(f"[{current.strftime('%H:%M:%S')}] 第 {polls} 輪：快照 {len(snap['rows'])} 檔，新訊號/事件 {sent}，今日累計 {len(STATE['signals'])}，"
-                  f"耗時 {elapsed:.2f}s｜{summary}（{delta:+,.0f}）" + (f"｜趨勢 {trend_txt}" if trend_txt else ""), flush=True)
+                  f"耗時 {elapsed:.2f}s｜{summary}（{delta:+,.0f}）" + (f"｜趨勢 {trend_txt}" if trend_txt else "") + (f"｜通知佇列 {ALERT_SENDER.pending()} 則" if ALERT_SENDER.pending() else ""), flush=True)
             if polls % 4 == 1:
                 print(f"    樣本 {sample_line(snap)}｜趨勢 {[(w.name, w.state) for w in regime.w.values()]}", flush=True)
             if polls % 20 == 0:
@@ -3791,9 +3891,12 @@ async def main_async() -> None:
     except Exception as exc:
         print(f"主迴圈發生未處理例外: {type(exc).__name__}: {repr(exc)}", flush=True)
         save_states()
+        await loop.run_in_executor(None, ALERT_SENDER.drain, 30)
         await loop.run_in_executor(None, send_telegram, f"⚠️ <b>【飆股雷達】</b> 監控異常中止：{type(exc).__name__}: {exc}")
         raise
     save_states()
+    if not await loop.run_in_executor(None, ALERT_SENDER.drain, 90):
+        print(f"[通知佇列] 收盤前仍有 {ALERT_SENDER.pending()} 則沒送完（Telegram 可能很慢），繼續收盤結算", flush=True)
     done = await run_post_close(bases, feed, loop, today, pools, regime, init, prefetch)
     if done:
         set_run_status("COMPLETED")
